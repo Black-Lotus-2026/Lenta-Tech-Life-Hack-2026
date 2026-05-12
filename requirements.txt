@@ -1,0 +1,10 @@
+numpy>=1.26
+opencv-python-headless>=4.8
+pandas>=2.0
+pillow>=10.0
+pytesseract>=0.3.10
+pyzbar>=0.1.9
+gradio>=4.44
+PyYAML>=6.0
+scipy>=1.10
+python-pptx>=0.6.23

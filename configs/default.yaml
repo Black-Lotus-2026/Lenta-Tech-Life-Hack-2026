@@ -1,0 +1,20 @@
+# Lenta Shelf AI default config. Works offline; put trained YOLO weights to models/price_tag_yolo.pt.
+sample_fps: 2.0
+yolo_weights: models/price_tag_yolo.pt
+yolo_conf: 0.23
+detector_imgsz: 1600
+min_sharpness: 18.0
+max_frames: 0
+max_detections_per_frame: 80
+enable_ocr: true
+enable_qr: true
+prefer_paddle: true
+ocr_lang: ru
+use_gpu: false
+crop_pad_px: 8
+tracker_iou: 0.12
+tracker_center_threshold: 250.0
+max_lost: 5
+min_track_observations: 1
+save_crops: false
+save_debug_json: true

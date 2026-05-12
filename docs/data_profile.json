@@ -1,0 +1,56 @@
+[
+  {
+    "video": "25_12-20/25_12-20.mp4",
+    "width": 3840,
+    "height": 2160,
+    "fps": 19.58,
+    "frames": 823,
+    "duration_s": 42.04,
+    "labels": 57
+  },
+  {
+    "video": "26_12-20/26_12-20.mp4",
+    "width": 3840,
+    "height": 2160,
+    "fps": 19.98,
+    "frames": 1776,
+    "duration_s": 88.89,
+    "labels": 71
+  },
+  {
+    "video": "43_15/43_15.mp4",
+    "width": 3840,
+    "height": 2160,
+    "fps": 19.95,
+    "frames": 299,
+    "duration_s": 14.99,
+    "labels": 29
+  },
+  {
+    "video": "Unlabeled/25_12-20.mp4",
+    "width": 3840,
+    "height": 2160,
+    "fps": 19.96,
+    "frames": 865,
+    "duration_s": 43.33,
+    "labels": "нет"
+  },
+  {
+    "video": "Unlabeled/26_12-20.mp4",
+    "width": 3840,
+    "height": 2160,
+    "fps": 20.01,
+    "frames": 634,
+    "duration_s": 31.69,
+    "labels": "нет"
+  },
+  {
+    "video": "Unlabeled/26_2-10.mp4",
+    "width": 3840,
+    "height": 2160,
+    "fps": 20.0,
+    "frames": 613,
+    "duration_s": 30.65,
+    "labels": "нет"
+  }
+]

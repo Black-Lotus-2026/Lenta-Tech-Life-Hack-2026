@@ -1,0 +1,7 @@
+-r requirements.txt
+ultralytics>=8.3.0
+paddleocr>=2.8.0
+paddlepaddle>=2.6.0
+zxing-cpp>=2.2.0
+onnx>=1.16.0
+onnxruntime>=1.18.0
