@@ -2,6 +2,7 @@
 ultralytics>=8.3.0
 paddleocr==3.3.3
 paddlepaddle==3.2.0
+langchain==0.3.27
 langchain-text-splitters>=0.3.0
 zxing-cpp>=2.2.0
 onnx>=1.16.0

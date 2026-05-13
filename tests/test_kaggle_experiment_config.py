@@ -35,6 +35,7 @@ def test_full_requirements_pin_python312_compatible_paddleocr_stack() -> None:
     assert "ultralytics" in requirements
     assert "paddleocr==3.3.3" in requirements
     assert "paddlepaddle==3.2.0" in requirements
+    assert "langchain==0.3.27" in requirements
     assert "langchain-text-splitters" in requirements
 
 
