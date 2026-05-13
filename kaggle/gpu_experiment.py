@@ -405,6 +405,7 @@ def main() -> None:
     cfg_path = work / "configs/kaggle_fast.yaml"
     pipeline_enable_ocr = env_bool("EXP_PIPELINE_ENABLE_OCR", False)
     pipeline_enable_qr = env_bool("EXP_PIPELINE_ENABLE_QR", True)
+    pipeline_defer_ocr = env_bool("EXP_PIPELINE_DEFER_OCR", False)
     pipeline_prefer_paddle = env_bool("EXP_PIPELINE_PREFER_PADDLE", False)
     pipeline_use_gpu = env_bool("EXP_PIPELINE_USE_GPU", False)
     pipeline_enable_fallbacks = env_bool("EXP_PIPELINE_ENABLE_FALLBACKS", False)
@@ -431,6 +432,7 @@ def main() -> None:
             "max_detections_per_frame": pipeline_max_detections,
             "enable_ocr": pipeline_enable_ocr,
             "enable_qr": pipeline_enable_qr,
+            "defer_ocr": pipeline_defer_ocr,
             "prefer_paddle": pipeline_prefer_paddle,
             "ocr_lang": "ru",
             "use_gpu": pipeline_use_gpu,
@@ -521,6 +523,7 @@ def main() -> None:
         "pipeline_config": {
             "enable_ocr": pipeline_enable_ocr,
             "enable_qr": pipeline_enable_qr,
+            "defer_ocr": pipeline_defer_ocr,
             "prefer_paddle": pipeline_prefer_paddle,
             "use_gpu": pipeline_use_gpu,
             "enable_fallback_detectors": pipeline_enable_fallbacks,

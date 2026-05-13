@@ -24,6 +24,7 @@ def test_full_ocr_kernel_requires_paddle_and_uses_cpu_compatible_runtime() -> No
 
     assert defaults["EXP_REQUIREMENTS"] == "requirements-full.txt"
     assert defaults["EXP_PIPELINE_ENABLE_OCR"] == "1"
+    assert defaults["EXP_PIPELINE_DEFER_OCR"] == "1"
     assert defaults["EXP_PIPELINE_PREFER_PADDLE"] == "1"
     assert defaults["EXP_PIPELINE_USE_GPU"] == "0"
     assert defaults["EXP_REQUIRE_PADDLE"] == "1"

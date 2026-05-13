@@ -18,7 +18,7 @@ from .qr import decode_qr_payloads
 from .schema import ABSENT_VALUE, OUTPUT_COLUMNS, QR_FIELD_ALIASES, Detection, TagObservation, ensure_columns
 from .tracker import SimpleTracker, Track
 from .utils import crop_xyxy, mkdir, sharpness_laplacian, read_yaml_or_json, normalize_text, iou_xyxy
-from .video import iter_video_frames, get_video_meta
+from .video import iter_video_frames, get_video_meta, read_frame_at_ms
 
 @dataclass
 class PipelineConfig:
@@ -32,6 +32,7 @@ class PipelineConfig:
     max_detections_per_frame: int = 80
     enable_ocr: bool = True
     enable_qr: bool = True
+    defer_ocr: bool = False
     prefer_paddle: bool = True
     ocr_lang: str = "ru"
     use_gpu: bool = False
@@ -74,9 +75,8 @@ class PriceTagPipeline:
         if self.config.enable_ocr:
             self.ocr = EnsembleOCREngine(prefer_paddle=bool(self.config.prefer_paddle), lang=str(self.config.ocr_lang), use_gpu=bool(self.config.use_gpu))
 
-    def _process_detection(self, filename: str, timestamp_ms: int, frame: np.ndarray, det: Detection, output_dir: Optional[Path], crop_idx: int) -> TagObservation:
+    def _recognize_detection(self, frame: np.ndarray, det: Detection, output_dir: Optional[Path], crop_name: str) -> tuple[str, list, list[str], Dict[str, str], float]:
         h, w = frame.shape[:2]
-        det = det.expanded(w, h, px=0.05, py=0.06).clamp(w, h)
         crop = crop_xyxy(frame, det.xyxy, pad=int(self.config.crop_pad_px))
         qr_payloads: List[str] = []
         if self.config.enable_qr:
@@ -93,6 +93,35 @@ class PriceTagPipeline:
         if qr_payloads:
             for qr_col in QR_FIELD_ALIASES:
                 parsed.setdefault(qr_col, ABSENT_VALUE)
+        if output_dir is not None and self.config.save_crops:
+            crop_dir = mkdir(output_dir / "crops")
+            cv2.imwrite(str(crop_dir / f"{crop_name}.jpg"), crop)
+        return text, ocr_lines, qr_payloads, parsed, sharpness_laplacian(crop)
+
+    def _process_detection(
+        self,
+        filename: str,
+        timestamp_ms: int,
+        frame: np.ndarray,
+        det: Detection,
+        output_dir: Optional[Path],
+        crop_idx: int,
+        recognize: bool = True,
+    ) -> TagObservation:
+        h, w = frame.shape[:2]
+        det = det.expanded(w, h, px=0.05, py=0.06).clamp(w, h)
+        text = ""
+        ocr_lines = []
+        qr_payloads: List[str] = []
+        parsed: Dict[str, str] = {}
+        image_quality = sharpness_laplacian(crop_xyxy(frame, det.xyxy, pad=int(self.config.crop_pad_px)))
+        if recognize:
+            text, ocr_lines, qr_payloads, parsed, image_quality = self._recognize_detection(
+                frame,
+                det,
+                output_dir,
+                f"{Path(filename).stem}_{timestamp_ms}_{crop_idx:03d}",
+            )
         obs = TagObservation(
             filename=filename,
             timestamp_ms=int(timestamp_ms),
@@ -101,11 +130,8 @@ class PriceTagPipeline:
             ocr_lines=ocr_lines,
             qr_payloads=qr_payloads,
             parsed=parsed,
-            image_quality=sharpness_laplacian(crop),
+            image_quality=image_quality,
         )
-        if output_dir is not None and self.config.save_crops:
-            crop_dir = mkdir(output_dir / "crops")
-            cv2.imwrite(str(crop_dir / f"{Path(filename).stem}_{timestamp_ms}_{crop_idx:03d}.jpg"), crop)
         return obs
 
     def run_video(self, video_path: str | Path, output_dir: str | Path = "outputs", output_csv: Optional[str | Path] = None) -> pd.DataFrame:
@@ -127,7 +153,8 @@ class PriceTagPipeline:
             observations: List[TagObservation] = []
             for i, det in enumerate(detections):
                 try:
-                    obs = self._process_detection(filename, packet.timestamp_ms, packet.frame_bgr, det, out_dir, i)
+                    recognize_now = not bool(self.config.defer_ocr)
+                    obs = self._process_detection(filename, packet.timestamp_ms, packet.frame_bgr, det, out_dir, i, recognize=recognize_now)
                     observations.append(obs)
                 except Exception as exc:
                     print(f"[WARN] detection processing failed at {packet.timestamp_ms} ms: {exc}")
@@ -142,6 +169,8 @@ class PriceTagPipeline:
             })
             print(f"[INFO] {filename} {packet.timestamp_ms} ms: det={len(detections)} obs={len(observations)}")
         tracks = tracker.active_and_finished_tracks()
+        if bool(self.config.defer_ocr) and (self.config.enable_ocr or self.config.enable_qr):
+            self._enrich_representatives(video_path, tracks, out_dir)
         rows = self._tracks_to_rows(tracks)
         df = pd.DataFrame(ensure_columns(rows), columns=OUTPUT_COLUMNS)
         if output_csv is None:
@@ -160,6 +189,36 @@ class PriceTagPipeline:
 
     def _select_best_observation(self, track: Track) -> Optional[TagObservation]:
         return track.select_best_observation(float(self.config.representative_temporal_weight))
+
+    def _enrich_representatives(self, video_path: Path, tracks: Iterable[Track], output_dir: Optional[Path]) -> None:
+        frame_cache: Dict[int, Optional[np.ndarray]] = {}
+        for tr in tracks:
+            obs = self._select_best_observation(tr)
+            if obs is None:
+                continue
+            if obs.text or obs.qr_payloads:
+                continue
+            ts = int(obs.timestamp_ms)
+            if ts not in frame_cache:
+                frame_cache[ts] = read_frame_at_ms(video_path, ts)
+            frame = frame_cache.get(ts)
+            if frame is None:
+                continue
+            try:
+                text, ocr_lines, qr_payloads, parsed, image_quality = self._recognize_detection(
+                    frame,
+                    obs.detection,
+                    output_dir,
+                    f"{Path(obs.filename).stem}_{ts}_track{tr.track_id:04d}",
+                )
+            except Exception as exc:
+                print(f"[WARN] deferred OCR/QR failed at {ts} ms track={tr.track_id}: {exc}")
+                continue
+            obs.text = text
+            obs.ocr_lines = ocr_lines
+            obs.qr_payloads = qr_payloads
+            obs.parsed = parsed
+            obs.image_quality = image_quality
 
     def _tracks_debug(self, tracks: Iterable[Track]) -> List[Dict[str, object]]:
         items: List[Dict[str, object]] = []
@@ -316,6 +375,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--sample-fps", type=float, default=None, help="Override frame sampling FPS")
     parser.add_argument("--weights", default=None, help="YOLO weights path")
     parser.add_argument("--fast", action="store_true", help="Disable OCR and use QR/color detector only")
+    parser.add_argument("--defer-ocr", action="store_true", help="Run OCR/QR only on the best crop per final track")
     parser.add_argument("--max-frames", type=int, default=None, help="Debug/quick run: process at most N sampled frames")
     args = parser.parse_args(argv)
 
@@ -324,6 +384,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg.sample_fps = args.sample_fps
     if args.weights is not None:
         cfg.yolo_weights = args.weights
+    if args.defer_ocr:
+        cfg.defer_ocr = True
     if args.fast:
         cfg.enable_ocr = False
         cfg.sample_fps = min(cfg.sample_fps, 1.0)

@@ -134,10 +134,13 @@ python scripts/infer_video.py data/Данные/Unlabeled/26_2-10.mp4 \
   --config configs/default.yaml \
   --output-dir outputs/unlabeled_26_2_10 \
   --weights models/price_tag_yolo.pt \
-  --sample-fps 2.0
+  --sample-fps 4.0 \
+  --defer-ocr
 ```
 
 Результат: `outputs/unlabeled_26_2_10/26_2-10_recognized.csv`.
+
+`--defer-ocr` включает соревновательный двухпроходный режим: детекция и трекинг идут часто, а OCR/QR запускаются только на лучшем crop каждого уникального ценника. Это резко дешевле, чем OCR каждого bbox на каждом кадре, и сохраняет recall от dense sampling.
 
 ---
 
@@ -161,7 +164,7 @@ action_price_qr, action_code_qr
 
 ## 5. Архитектура пайплайна
 
-1. **Sampling**: 4K MP4 читается с частотой 1-2 FPS, размазанные кадры отсекаются по Laplacian sharpness.
+1. **Sampling**: 4K MP4 читается с частотой 2-4 FPS, размазанные кадры отсекаются по Laplacian sharpness.
 2. **Detection**:
    - основной детектор: дообученный YOLO11n/YOLOv8n;
    - QR-seed: если QR найден раньше ценника, область расширяется до всего ценника;
@@ -170,7 +173,7 @@ action_price_qr, action_code_qr
 4. **QR/barcode**: zxing-cpp -> pyzbar -> OpenCV QR. QR-поля имеют приоритет над OCR.
 5. **OCR**: PaddleOCR для accuracy-режима, Tesseract rus+eng fallback для CPU-safe.
 6. **Parsing**: регулярные выражения и доменные правила для цен, скидки, EAN-13, SKU, даты печати, кода зоны, special symbols, цвета.
-7. **Temporal fusion**: один ценник объединяется по треку/QR/barcode/product+price; выбирается лучший crop по QR/OCR/sharpness.
+7. **Temporal fusion**: один ценник объединяется по треку/QR/barcode/product+price; выбирается лучший crop по QR/OCR/sharpness. В режиме `defer_ocr` OCR/QR выполняются после трекинга только для representative crop.
 8. **CSV export**: фиксированная схема Lenta Tech.
 
 Схема и критика подробно описаны в `docs/architecture.md` и `docs/self_critique.md`.

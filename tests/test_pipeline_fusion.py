@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+import numpy as np
+
 from lenta_shelf_ai.pipeline import PipelineConfig, PriceTagPipeline
-from lenta_shelf_ai.schema import Detection, TagObservation
+from lenta_shelf_ai.schema import Detection, OCRLine, TagObservation
 from lenta_shelf_ai.tracker import Track
 
 
@@ -43,3 +47,22 @@ def test_spatial_dedupe_keeps_conflicting_barcodes_separate() -> None:
     )
 
     assert len(rows) == 2
+
+
+def test_deferred_ocr_enriches_best_track_observation(monkeypatch) -> None:
+    image = np.full((80, 120, 3), 255, dtype=np.uint8)
+    monkeypatch.setattr("lenta_shelf_ai.pipeline.read_frame_at_ms", lambda *_: image)
+
+    class FakeOCR:
+        def recognize(self, _crop):
+            return [OCRLine("Молоко тестовое", confidence=0.9, engine="fake")]
+
+    pipe = PriceTagPipeline(PipelineConfig(enable_ocr=False, enable_qr=False, defer_ocr=True))
+    pipe.config.enable_ocr = True
+    pipe.ocr = FakeOCR()
+    tr = _track(1, 1000, [10, 10, 70, 50])
+
+    pipe._enrich_representatives(Path("video.mp4"), [tr], None)
+    rows = pipe._tracks_to_rows([tr])
+
+    assert rows[0]["product_name"] == "Молоко тестовое"
