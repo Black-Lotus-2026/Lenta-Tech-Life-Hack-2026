@@ -19,7 +19,7 @@ EXPERIMENTS = [
         "id": "whitenigger/lenta-shelf-ai-exp-a",
         "title": "Lenta Shelf AI Exp A",
         "defaults": {
-            "EXP_NAME": "exp-a-reprw3-fast4-noqr-conf008",
+            "EXP_NAME": "exp-a-qualityrepr-fast4-noqr-conf008",
             "EXP_REQUIRE_GPU_NAME": "T4",
             "EXP_REQUIRE_GPU_COUNT": "2",
             "EXP_DEVICE": "0",
@@ -40,7 +40,7 @@ EXPERIMENTS = [
             "EXP_PIPELINE_YOLO_CONF": "0.08",
             "EXP_PIPELINE_SAMPLE_FPS": "4.0",
             "EXP_PIPELINE_MAX_DETECTIONS": "60",
-            "EXP_REPRESENTATIVE_TEMPORAL_WEIGHT": "3.0",
+            "EXP_REPRESENTATIVE_TEMPORAL_WEIGHT": "0.0",
         },
     },
     {
@@ -48,7 +48,7 @@ EXPERIMENTS = [
         "id": "whitenigger/lenta-shelf-ai-exp-b",
         "title": "Lenta Shelf AI Exp B",
         "defaults": {
-            "EXP_NAME": "exp-b-paddle332-stable-fullocr-1fps",
+            "EXP_NAME": "exp-b-parserfix-fullocr-1fps",
             "EXP_REQUIRE_GPU_NAME": "T4",
             "EXP_REQUIRE_GPU_COUNT": "2",
             "EXP_DEVICE": "0",
@@ -70,7 +70,7 @@ EXPERIMENTS = [
             "EXP_PIPELINE_YOLO_CONF": "0.12",
             "EXP_PIPELINE_SAMPLE_FPS": "1.0",
             "EXP_PIPELINE_MAX_DETECTIONS": "40",
-            "EXP_PIPELINE_SAVE_CROPS": "1",
+            "EXP_PIPELINE_SAVE_CROPS": "0",
             "EXP_REPRESENTATIVE_TEMPORAL_WEIGHT": "0.0",
         },
     },

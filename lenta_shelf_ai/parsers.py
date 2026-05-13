@@ -19,6 +19,8 @@ EAN_RE = re.compile(r"(?<!\d)(\d{8,14})(?!\d)")
 SKU_RE = re.compile(r"(?<!\d)(\d{9,13})(?!\d)")
 SPECIAL_RE = re.compile(r"(?:^|\s)([ШШшКкЛл])(?:\s|$)")
 CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
+VOLUME_CONTEXT_RE = re.compile(r"(?:л|l|литр|мл|ml|кг|kg|гр|г)(?![а-яa-z])", re.I)
+CURRENCY_CONTEXT_RE = re.compile(r"(?:руб|₽|коп)", re.I)
 
 KNOWN_INFO_WORDS = [
     "сухое", "полусухое", "полусладкое", "сладкое", "брют", "экстра", "удачная упаковка",
@@ -67,10 +69,17 @@ def classify_color(crop_bgr: np.ndarray) -> str:
 
 def _find_prices(text: str) -> List[str]:
     prices = []
-    for a, b in PRICE_RE.findall(text.replace("\u00a0", " ")):
+    text = text.replace("\u00a0", " ")
+    for match in PRICE_RE.finditer(text):
+        a, b = match.group(1), match.group(2)
         try:
             value = float(f"{a}.{b}")
         except ValueError:
+            continue
+        context = text[max(0, match.start() - 12) : min(len(text), match.end() + 12)]
+        if value < 2.0 and VOLUME_CONTEXT_RE.search(context) and not CURRENCY_CONTEXT_RE.search(context):
+            continue
+        if value < 2.0 and not CURRENCY_CONTEXT_RE.search(context):
             continue
         if 0.01 <= value <= 999999:
             s = f"{value:.2f}"
@@ -83,7 +92,11 @@ def _find_barcodes(text: str) -> List[str]:
     nums = [m.group(1) for m in EAN_RE.finditer(text)]
     nums = [re.sub(r"\D", "", n) for n in nums]
     valid = [n for n in nums if ean13_is_valid(n)]
-    return valid or nums
+    if valid:
+        return valid
+    # A non-valid OCR number is usually worse than blank for the hidden metric
+    # and can incorrectly merge tracks. QR parser still keeps 14-digit codes.
+    return []
 
 
 def _canonical_value(value: object) -> str:

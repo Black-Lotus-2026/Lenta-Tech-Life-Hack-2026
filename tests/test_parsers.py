@@ -23,6 +23,26 @@ def test_text_parser_prices_discount():
     assert out["discount_amount"] == "-48%"
 
 
+def test_text_parser_does_not_treat_volume_as_price():
+    lines = [
+        OCRLine("Вино красное сухое Франция 0.75L"),
+        OCRLine("Цена 599,99 руб"),
+    ]
+
+    out = parse_text_fields(lines, {})
+
+    assert out["price_default"] == "599.99"
+    assert out.get("price_card", "") != "0.75"
+
+
+def test_text_parser_rejects_invalid_ocr_barcode_noise():
+    lines = [OCRLine("270207716054"), OCRLine("Товар тестовый")]
+
+    out = parse_text_fields(lines, {})
+
+    assert "barcode" not in out
+
+
 def test_parser_rejects_non_cyrillic_product_garbage():
     lines = [OCRLine("NI KE afi | i\\ 3)/ fel | ee All")]
 
