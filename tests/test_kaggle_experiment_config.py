@@ -17,6 +17,7 @@ def test_detector_diagnostic_kernel_disables_qr_to_avoid_native_crashes() -> Non
 
     assert defaults["EXP_PIPELINE_ENABLE_OCR"] == "0"
     assert defaults["EXP_PIPELINE_ENABLE_QR"] == "0"
+    assert defaults["EXP_PIPELINE_ENABLE_FALLBACKS"] == "1"
 
 
 def test_full_ocr_kernel_requires_paddle_and_uses_cpu_compatible_runtime() -> None:
