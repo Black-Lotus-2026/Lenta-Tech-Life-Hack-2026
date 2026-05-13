@@ -18,6 +18,7 @@ lenta_shelf_ai/
   pipeline.py         # видео -> CSV
 scripts/
   build_yolo_dataset.py    # автоматическая сборка YOLO-датасета из public CSV
+  build_pseudo_yolo_dataset.py # pseudo-labeling Unlabeled/*.mp4 для self-training
   train_detector.py        # обучение компактного детектора
   infer_video.py           # CLI inference
   evaluate_on_public.py    # строгая локальная proxy-оценка
@@ -100,7 +101,33 @@ cp runs/lenta/price_tag_yolo/weights/best.pt models/price_tag_yolo.pt
 
 Если GPU нет, можно поставить `--device cpu --epochs 50`, но качество будет ниже.
 
-### 3.5 Inference
+### 3.5 Self-training без ручной разметки
+
+После первого детектора можно автоматически разметить `Unlabeled/*.mp4` только high-confidence предсказаниями и дообучить модель:
+
+```bash
+python scripts/build_pseudo_yolo_dataset.py \
+  --data-dir data/Данные \
+  --base-dataset datasets/lenta_yolo \
+  --out-dir datasets/lenta_yolo_self \
+  --weights models/price_tag_yolo.pt \
+  --sample-fps 1.0 \
+  --conf 0.65 \
+  --imgsz 1600
+
+python scripts/train_detector.py \
+  --data datasets/lenta_yolo_self/data.yaml \
+  --model models/price_tag_yolo.pt \
+  --epochs 30 \
+  --imgsz 1280 \
+  --batch 4 \
+  --device 0 \
+  --name price_tag_yolo_selftrain
+```
+
+Это не использует ручную разметку: pseudo-labels берутся только из локального detector-а.
+
+### 3.6 Inference
 
 ```bash
 python scripts/infer_video.py data/Данные/Unlabeled/26_2-10.mp4 \

@@ -18,6 +18,7 @@ ZONE_RE = re.compile(r"(\d{2}_\d{6}\s*-\s*\d{6})")
 EAN_RE = re.compile(r"(?<!\d)(\d{8,14})(?!\d)")
 SKU_RE = re.compile(r"(?<!\d)(\d{9,13})(?!\d)")
 SPECIAL_RE = re.compile(r"(?:^|\s)([ШШшКкЛл])(?:\s|$)")
+CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
 
 KNOWN_INFO_WORDS = [
     "сухое", "полусухое", "полусладкое", "сладкое", "брют", "экстра", "удачная упаковка",
@@ -85,12 +86,22 @@ def _find_barcodes(text: str) -> List[str]:
     return valid or nums
 
 
+def _canonical_value(value: object) -> str:
+    text = normalize_text(str(value or ""))
+    # Some OCR/models render Cyrillic "нет" with visually similar Greek glyphs.
+    if text.lower() in {"нет", "νες", "νετ"}:
+        return ABSENT_VALUE
+    return text
+
+
 def _candidate_product_lines(lines: Sequence[OCRLine]) -> List[str]:
     candidates: List[str] = []
     bad = re.compile(r"(руб|коп|цена|скид|карте|штрих|артикул|qr|код|дата|печати|итого|%|₽)", re.I)
     for line in lines:
         text = normalize_text(line.text)
         if len(text) < 5:
+            continue
+        if not CYRILLIC_RE.search(text):
             continue
         if bad.search(text):
             continue
@@ -197,7 +208,7 @@ def parse_text_fields(lines: Sequence[OCRLine], qr_fields: Dict[str, str], crop_
         if col in fields and fields[col] not in {"", ABSENT_VALUE}:
             fields[col] = price_to_str(fields[col])
 
-    return fields
+    return {k: _canonical_value(v) for k, v in fields.items()}
 
 
 def parse_observation(lines: Sequence[OCRLine], qr_payloads: Iterable[str], crop_bgr: Optional[np.ndarray] = None) -> Dict[str, str]:
@@ -206,7 +217,7 @@ def parse_observation(lines: Sequence[OCRLine], qr_payloads: Iterable[str], crop
 
 
 def merge_field_values(values: Iterable[str]) -> str:
-    vals = [str(v).strip() for v in values if v is not None and str(v).strip() != ""]
+    vals = [_canonical_value(v) for v in values if v is not None and _canonical_value(v) != ""]
     if not vals:
         return ""
     # Penalize OCR garbage; prefer non-"нет", longer names and valid-looking numbers.

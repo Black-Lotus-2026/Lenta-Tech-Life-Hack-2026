@@ -6,6 +6,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
 
 import argparse
+import hashlib
 import os
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
@@ -15,7 +16,6 @@ import pandas as pd
 
 from lenta_shelf_ai.schema import LEGACY_COLUMN_ALIASES
 from lenta_shelf_ai.utils import mkdir, smart_float, clip_xyxy
-from lenta_shelf_ai.video import read_frame_at_ms
 
 
 def yolo_line(box, width: int, height: int, cls: int = 0) -> str:
@@ -25,6 +25,16 @@ def yolo_line(box, width: int, height: int, cls: int = 0) -> str:
     bw = (x2 - x1) / width
     bh = (y2 - y1) / height
     return f"{cls} {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}"
+
+
+def is_validation_sample(video_key: str, timestamp_ms: float, val_ratio: float) -> bool:
+    if val_ratio <= 0:
+        return False
+    if val_ratio >= 1:
+        return True
+    key = f"{video_key}:{int(round(timestamp_ms))}".encode("utf-8")
+    bucket = int(hashlib.md5(key).hexdigest()[:8], 16) / 0xFFFFFFFF
+    return bucket < val_ratio
 
 
 def template_track(prev_frame, next_frame, box, search_pad=80):
@@ -46,6 +56,12 @@ def template_track(prev_frame, next_frame, box, search_pad=80):
     return new_box, float(max_val)
 
 
+def read_frame_at_ms_from_cap(cap: cv2.VideoCapture, timestamp_ms: float):
+    cap.set(cv2.CAP_PROP_POS_MSEC, float(timestamp_ms))
+    ok, frame = cap.read()
+    return frame if ok else None
+
+
 def build_dataset(data_dir: Path, out_dir: Path, propagate: int = 0, val_ratio: float = 0.2) -> None:
     images_train = mkdir(out_dir / "images/train")
     images_val = mkdir(out_dir / "images/val")
@@ -65,7 +81,7 @@ def build_dataset(data_dir: Path, out_dir: Path, propagate: int = 0, val_ratio: 
         fps = cap.get(cv2.CAP_PROP_FPS) or 20.0
         for ts, group in df.groupby("frame_timestamp"):
             tsf = smart_float(ts)
-            base_frame = read_frame_at_ms(video_path, tsf)
+            base_frame = read_frame_at_ms_from_cap(cap, tsf)
             if base_frame is None:
                 continue
             boxes = []
@@ -79,7 +95,7 @@ def build_dataset(data_dir: Path, out_dir: Path, propagate: int = 0, val_ratio: 
                     prev_boxes = boxes
                     for step in range(1, propagate + 1):
                         t = max(0.0, tsf + direction * step * 1000.0 / fps)
-                        frame = read_frame_at_ms(video_path, t)
+                        frame = read_frame_at_ms_from_cap(cap, t)
                         if frame is None:
                             break
                         tracked = []
@@ -94,7 +110,7 @@ def build_dataset(data_dir: Path, out_dir: Path, propagate: int = 0, val_ratio: 
                             break
             for frame, bxs, offset, q in frame_variants:
                 h, w = frame.shape[:2]
-                split_val = (frame_id % max(2, int(round(1 / max(1e-6, val_ratio))))) == 0
+                split_val = is_validation_sample(video_path.stem, tsf, val_ratio)
                 img_dir = images_val if split_val else images_train
                 lab_dir = labels_val if split_val else labels_train
                 name = f"{video_path.stem}_{int(round(tsf)):08d}_{offset:+03d}_{frame_id:06d}.jpg"

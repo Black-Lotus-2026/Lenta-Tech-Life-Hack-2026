@@ -24,3 +24,6 @@ lenta-infer = "lenta_shelf_ai.pipeline:main"
 
 [tool.ruff]
 line-length = 120
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

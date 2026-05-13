@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import inspect
+import os
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -38,27 +40,67 @@ class BaseOCREngine:
 
 class PaddleOCREngine(BaseOCREngine):
     def __init__(self, lang: str = "ru", use_gpu: bool = False):
+        # PaddlePaddle 3.3.x CPU oneDNN/PIR path is unstable for OCR inference.
+        # Keep CPU inference on the plain backend unless the runtime explicitly opts in.
+        os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "0")
+        os.environ.setdefault("FLAGS_use_mkldnn", "False")
+        os.environ.setdefault("FLAGS_use_onednn", "False")
+        os.environ.setdefault("FLAGS_use_dnnl", "False")
         try:
             from paddleocr import PaddleOCR
         except Exception as exc:  # pragma: no cover - optional dep
             raise ImportError("Install paddleocr to enable Paddle OCR") from exc
         # Works across PaddleOCR 2.x and 3.x with minor API differences.
-        kwargs = dict(use_angle_cls=True, lang=lang, show_log=False, use_gpu=use_gpu)
-        try:
-            self.ocr = PaddleOCR(**kwargs)
-        except TypeError:
-            kwargs.pop("show_log", None)
-            self.ocr = PaddleOCR(**kwargs)
+        params = inspect.signature(PaddleOCR).parameters
+        self._legacy_api = "use_angle_cls" in params
+        if self._legacy_api:
+            kwargs = dict(use_angle_cls=True, lang=lang, show_log=False, use_gpu=use_gpu)
+            try:
+                self.ocr = PaddleOCR(**kwargs)
+            except TypeError:
+                kwargs.pop("show_log", None)
+                self.ocr = PaddleOCR(**kwargs)
+        else:
+            kwargs = dict(
+                lang=lang,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=True,
+            )
+            if use_gpu:
+                kwargs["device"] = "gpu:0"
+            try:
+                self.ocr = PaddleOCR(**kwargs)
+            except TypeError:
+                kwargs.pop("device", None)
+                self.ocr = PaddleOCR(**kwargs)
         self.engine = "paddleocr"
 
     def recognize(self, image_bgr: np.ndarray) -> List[OCRLine]:
         image_bgr = enhance_crop(image_bgr)
-        try:
-            result = self.ocr.ocr(image_bgr, cls=True)
-        except TypeError:
+        if self._legacy_api:
+            try:
+                result = self.ocr.ocr(image_bgr, cls=True)
+            except TypeError:
+                result = self.ocr.ocr(image_bgr)
+        else:
             result = self.ocr.ocr(image_bgr)
         lines: List[OCRLine] = []
         if not result:
+            return lines
+        # PaddleOCR 3.x returns page-level mappings with rec_texts/rec_scores/rec_polys.
+        if isinstance(result, list) and result and hasattr(result[0], "get"):
+            for page in result:
+                texts = list(page.get("rec_texts") or [])
+                scores = list(page.get("rec_scores") or [])
+                boxes = list(page.get("rec_polys") or page.get("rec_boxes") or [])
+                for i, text in enumerate(texts):
+                    text = normalize_text(str(text))
+                    if not text:
+                        continue
+                    conf = float(scores[i]) if i < len(scores) else 0.0
+                    box = boxes[i] if i < len(boxes) else None
+                    lines.append(OCRLine(text=text, confidence=conf, box=box, engine=self.engine))
             return lines
         # PaddleOCR sometimes returns [lines] and sometimes lines directly.
         if len(result) == 1 and isinstance(result[0], list) and result[0] and isinstance(result[0][0], (list, tuple)):
@@ -132,6 +174,9 @@ class TesseractOCREngine(BaseOCREngine):
 class EnsembleOCREngine(BaseOCREngine):
     def __init__(self, prefer_paddle: bool = True, lang: str = "ru", use_gpu: bool = False):
         self.engines: List[BaseOCREngine] = []
+        self._failure_counts: dict[int, int] = {}
+        self._disabled_engines: set[int] = set()
+        self._max_engine_failures = max(1, int(os.environ.get("LENTA_OCR_MAX_ENGINE_FAILURES", "3")))
         if prefer_paddle:
             try:
                 self.engines.append(PaddleOCREngine(lang=lang, use_gpu=use_gpu))
@@ -144,11 +189,17 @@ class EnsembleOCREngine(BaseOCREngine):
 
     def recognize(self, image_bgr: np.ndarray) -> List[OCRLine]:
         all_lines: List[OCRLine] = []
-        for engine in self.engines:
+        for idx, engine in enumerate(self.engines):
+            if idx in self._disabled_engines:
+                continue
             try:
                 all_lines.extend(engine.recognize(image_bgr))
             except Exception as exc:
                 print(f"[WARN] OCR engine failed: {exc}")
+                self._failure_counts[idx] = self._failure_counts.get(idx, 0) + 1
+                if self._failure_counts[idx] >= self._max_engine_failures:
+                    self._disabled_engines.add(idx)
+                    print(f"[WARN] OCR engine {getattr(engine, 'engine', idx)} disabled after {self._failure_counts[idx]} failures")
         # Keep high-confidence unique text first.
         unique: List[OCRLine] = []
         seen = set()

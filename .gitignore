@@ -5,15 +5,10 @@ outputs/
 runs/
 datasets/
 data/
+kaggle_work/
 models/*.pt
 models/*.onnx
 models/*.rknn
 models/*_openvino_model/
 *.log
 .DS_Store
-
-# Tables, slides, raster images (keep locally; do not commit)
-*.pptx
-*.csv
-*.png
-assets/*.jpg

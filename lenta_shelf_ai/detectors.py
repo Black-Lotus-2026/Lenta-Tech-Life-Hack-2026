@@ -160,6 +160,140 @@ class ColorGeometryDetector(BaseDetector):
                 detections.append(Detection(x1, y1, x2, y2, float(score), source="heuristic"))
         return detections
 
+class RedWhiteTagDetector(BaseDetector):
+    """Detect common Lenta tags from a red price panel plus adjacent white text/QR area."""
+
+    def __init__(
+        self,
+        max_width: int = 1600,
+        min_red_area: int = 80,
+        max_candidate_area_ratio: float = 0.035,
+        nms_iou: float = 0.25,
+    ):
+        self.max_width = max_width
+        self.min_red_area = min_red_area
+        self.max_candidate_area_ratio = max_candidate_area_ratio
+        self.nms_iou = nms_iou
+
+    def _resize(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, float]:
+        h, w = frame_bgr.shape[:2]
+        scale = 1.0
+        if w > self.max_width:
+            scale = self.max_width / float(w)
+            frame_bgr = cv2.resize(frame_bgr, (self.max_width, int(round(h * scale))), interpolation=cv2.INTER_AREA)
+        return frame_bgr, scale
+
+    @staticmethod
+    def _red_mask(im: np.ndarray) -> np.ndarray:
+        hsv = cv2.cvtColor(im, cv2.COLOR_BGR2HSV)
+        ranges = [
+            ((0, 45, 70), (14, 255, 255)),
+            ((165, 35, 70), (179, 255, 255)),
+            ((4, 35, 85), (28, 235, 255)),  # faded orange/red price panels
+        ]
+        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        for lo, hi in ranges:
+            mask = cv2.bitwise_or(mask, cv2.inRange(hsv, np.array(lo, np.uint8), np.array(hi, np.uint8)))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 7))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        return mask
+
+    @staticmethod
+    def _white_mask(im: np.ndarray) -> np.ndarray:
+        hsv = cv2.cvtColor(im, cv2.COLOR_BGR2HSV)
+        return cv2.inRange(hsv, np.array((0, 0, 135), np.uint8), np.array((179, 90, 255), np.uint8))
+
+    @staticmethod
+    def _candidate_boxes(x: int, y: int, bw: int, bh: int) -> List[List[float]]:
+        boxes: List[List[float]] = []
+        # Price panel is most often on the left or right side of the tag.
+        for width_mult in (2.1, 2.5, 2.85, 3.2):
+            boxes.append([x - 0.10 * bw, y - 0.06 * bh, x + width_mult * bw, y + 1.06 * bh])
+            boxes.append([x - (width_mult - 1.0) * bw, y - 0.06 * bh, x + 1.10 * bw, y + 1.06 * bh])
+        # Some shelf labels are rotated relative to the image and expose a horizontal red strip.
+        for height_mult in (2.0, 2.4, 2.8):
+            boxes.append([x - 0.06 * bw, y - 0.10 * bh, x + 1.06 * bw, y + height_mult * bh])
+            boxes.append([x - 0.06 * bw, y - (height_mult - 1.0) * bh, x + 1.06 * bw, y + 1.10 * bh])
+        return boxes
+
+    def _score_candidate(
+        self,
+        box: Sequence[float],
+        im: np.ndarray,
+        red_mask: np.ndarray,
+        white_mask: np.ndarray,
+        edges: np.ndarray,
+    ) -> Optional[List[float]]:
+        ih, iw = im.shape[:2]
+        x1, y1, x2, y2 = clip_xyxy(box, iw, ih)
+        cw, ch = x2 - x1, y2 - y1
+        if cw < 24 or ch < 24:
+            return None
+        ar = cw / max(1.0, ch)
+        area = cw * ch
+        area_ratio = area / max(1.0, iw * ih)
+        if ar < 0.24 or ar > 1.85:
+            return None
+        if cw > max(iw * 0.18, 260.0) or ch > max(ih * 0.32, 260.0):
+            return None
+        if area_ratio < 0.0008:
+            return None
+        max_candidate_area = max(iw * ih * self.max_candidate_area_ratio, 60000.0)
+        if area > max_candidate_area:
+            return None
+        roi = (slice(int(y1), int(y2)), slice(int(x1), int(x2)))
+        red_ratio = float((red_mask[roi] > 0).mean())
+        white_ratio = float((white_mask[roi] > 0).mean())
+        edge_density = float((edges[roi] > 0).mean())
+        if red_ratio < 0.045 or white_ratio < 0.16 or edge_density < 0.012:
+            return None
+        shape_score = max(0.0, 1.0 - abs(ar - 0.82) / 0.82)
+        area_score = max(0.0, 1.0 - abs(area_ratio - 0.0075) / 0.016)
+        score = (
+            0.45
+            + 0.18 * min(1.0, red_ratio / 0.30)
+            + 0.18 * min(1.0, white_ratio / 0.45)
+            + 0.14 * min(1.0, edge_density / 0.08)
+            + 0.12 * shape_score
+            + 0.08 * area_score
+        )
+        return [x1, y1, x2, y2, float(score)]
+
+    def predict(self, frame_bgr: np.ndarray) -> List[Detection]:
+        im, scale = self._resize(frame_bgr)
+        ih, iw = im.shape[:2]
+        red_mask = self._red_mask(im)
+        white_mask = self._white_mask(im)
+        gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 60, 160)
+        contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes: List[List[float]] = []
+        max_red_area = max(iw * ih * 0.020, 18000.0)
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < self.min_red_area or area > max_red_area:
+                continue
+            x, y, bw, bh = cv2.boundingRect(contour)
+            if bw < 8 or bh < 8:
+                continue
+            fill = area / max(1.0, bw * bh)
+            if fill < 0.18:
+                continue
+            for candidate in self._candidate_boxes(x, y, bw, bh):
+                scored = self._score_candidate(candidate, im, red_mask, white_mask, edges)
+                if scored is not None:
+                    boxes.append(scored)
+
+        boxes = nms_xyxy(boxes, self.nms_iou)
+        detections: List[Detection] = []
+        h, w = frame_bgr.shape[:2]
+        for x1, y1, x2, y2, score in boxes:
+            x1, y1, x2, y2 = [v / scale for v in (x1, y1, x2, y2)]
+            x1, y1, x2, y2 = clip_xyxy([x1, y1, x2, y2], w, h)
+            detections.append(Detection(x1, y1, x2, y2, float(score), source="red_white_tag"))
+        return detections
+
 class QRSeedDetector(BaseDetector):
     """Finds QR codes and expands them into approximate tag boxes."""
 
@@ -195,15 +329,19 @@ class QRSeedDetector(BaseDetector):
         return detections
 
 class HybridDetector(BaseDetector):
-    def __init__(self, yolo_weights: Optional[str] = None, yolo_conf: float = 0.25, imgsz: int = 1280):
+    def __init__(self, yolo_weights: Optional[str] = None, yolo_conf: float = 0.25, imgsz: int = 1280, enable_fallbacks: bool = True):
         self.detectors: List[BaseDetector] = []
+        loaded_yolo = False
         if yolo_weights and Path(yolo_weights).exists():
             try:
                 self.detectors.append(YOLODetector(yolo_weights, conf=yolo_conf, imgsz=imgsz))
+                loaded_yolo = True
             except Exception as exc:
                 print(f"[WARN] YOLO disabled: {exc}")
-        self.detectors.append(QRSeedDetector(max_width=imgsz))
-        self.detectors.append(ColorGeometryDetector(max_width=imgsz))
+        if enable_fallbacks or not loaded_yolo:
+            self.detectors.append(QRSeedDetector(max_width=imgsz))
+            self.detectors.append(RedWhiteTagDetector(max_width=imgsz))
+            self.detectors.append(ColorGeometryDetector(max_width=imgsz))
 
     def predict(self, frame_bgr: np.ndarray) -> List[Detection]:
         boxes: List[List[float]] = []

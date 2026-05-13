@@ -49,8 +49,10 @@ def main():
         workers=2,
         seed=42,
     )
-    best = Path(args.project) / args.name / "weights" / "best.pt"
-    print(f"[DONE] best weights expected at: {best}")
+    expected = Path(args.project) / args.name / "weights" / "best.pt"
+    candidates = [p for p in Path(".").glob("runs/**/weights/best.pt") if p.is_file()]
+    best = max(candidates, key=lambda p: p.stat().st_mtime) if candidates else expected
+    print(f"[DONE] best weights: {best}")
 
 if __name__ == "__main__":
     main()

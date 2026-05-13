@@ -1,5 +1,5 @@
 from lenta_shelf_ai.qr import parse_qr_payload
-from lenta_shelf_ai.parsers import ean13_is_valid, parse_text_fields
+from lenta_shelf_ai.parsers import ean13_is_valid, merge_field_values, parse_text_fields
 from lenta_shelf_ai.schema import OCRLine
 
 
@@ -21,3 +21,15 @@ def test_text_parser_prices_discount():
     assert out["price_default"] == "252.63"
     assert out["price_card"] == "129.99"
     assert out["discount_amount"] == "-48%"
+
+
+def test_parser_rejects_non_cyrillic_product_garbage():
+    lines = [OCRLine("NI KE afi | i\\ 3)/ fel | ee All")]
+
+    out = parse_text_fields(lines, {})
+
+    assert "product_name" not in out
+
+
+def test_merge_canonicalizes_greek_absent_noise():
+    assert merge_field_values(["\u03bd\u03b5\u03c2", "нет"]) == "нет"
