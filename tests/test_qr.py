@@ -43,3 +43,16 @@ def test_parse_qr_payload_accepts_gs1_gtin() -> None:
     parsed = parse_qr_payload("(01)04670025474665")
 
     assert parsed["qr_code_barcode"] == "4670025474665"
+
+
+def test_qr_candidate_regions_not_truncated_to_three_regions():
+    image = np.full((180, 320, 3), 245, dtype=np.uint8)
+    # Dense square-like QR surrogate in a late-prior/contour region.
+    for y in range(115, 160, 12):
+        for x in range(245, 295, 12):
+            if (x + y) % 24 == 0:
+                cv2.rectangle(image, (x, y), (x + 7, y + 7), (0, 0, 0), -1)
+
+    regions = _qr_candidate_regions(image)
+
+    assert len(regions) > 3

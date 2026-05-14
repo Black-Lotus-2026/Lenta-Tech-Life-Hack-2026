@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -113,6 +114,60 @@ def price_to_str(value: Any) -> str:
         return f"{float(value):.2f}"
     except Exception:
         return str(value)
+
+
+def perceptual_hash(image: np.ndarray, hash_size: int = 8) -> str:
+    """Return a deterministic 64-bit dHash hex string for a crop.
+
+    The hash is intentionally cheap and dependency-free. It is used only as a
+    duplicate hint after spatial/text gates, never as a stable product ID.
+    """
+    if image is None or getattr(image, "size", 0) == 0:
+        return ""
+    try:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+        small = cv2.resize(gray, (hash_size + 1, hash_size), interpolation=cv2.INTER_AREA)
+        diff = small[:, 1:] > small[:, :-1]
+        value = 0
+        for bit in diff.flatten():
+            value = (value << 1) | int(bool(bit))
+        return f"{value:0{hash_size * hash_size // 4}x}"
+    except Exception:
+        return ""
+
+
+def hamming_distance_hex(a: str, b: str) -> int:
+    """Hamming distance for equal-length hexadecimal hashes."""
+    if not a or not b or len(a) != len(b):
+        return 10**9
+    try:
+        return (int(a, 16) ^ int(b, 16)).bit_count()
+    except Exception:
+        return 10**9
+
+
+def normalize_for_similarity(text: str) -> str:
+    text = normalize_text(str(text or "")).lower()
+    # Keep Cyrillic/Latin/digits; remove OCR separators and punctuation noise.
+    text = text.replace("ё", "е")
+    text = re.sub(r"[^0-9a-zа-я]+", " ", text, flags=re.I)
+    return normalize_text(text)
+
+
+def text_similarity(a: str, b: str) -> float:
+    """Fast normalized text similarity with optional RapidFuzz fallback."""
+    aa = normalize_for_similarity(a)
+    bb = normalize_for_similarity(b)
+    if not aa or not bb:
+        return 0.0
+    if aa == bb:
+        return 1.0
+    try:  # pragma: no cover - optional acceleration
+        from rapidfuzz import fuzz
+
+        return float(fuzz.token_set_ratio(aa, bb)) / 100.0
+    except Exception:
+        return float(SequenceMatcher(None, aa, bb).ratio())
 
 
 def read_yaml_or_json(path: Optional[str]) -> Dict[str, Any]:

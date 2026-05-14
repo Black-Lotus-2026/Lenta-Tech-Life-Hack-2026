@@ -66,3 +66,105 @@ def test_deferred_ocr_enriches_best_track_observation(monkeypatch) -> None:
     rows = pipe._tracks_to_rows([tr])
 
     assert rows[0]["product_name"] == "Молоко тестовое"
+
+
+def test_name_price_alone_does_not_merge_far_apart_real_tags() -> None:
+    pipe = PriceTagPipeline(PipelineConfig(enable_ocr=False))
+
+    rows = pipe._tracks_to_rows(
+        [
+            _track(1, 1000, [100, 100, 220, 210], {"product_name": "Молоко тест", "price_default": "129.99"}),
+            _track(2, 1000, [900, 100, 1020, 210], {"product_name": "Молоко тест", "price_default": "129.99"}),
+        ]
+    )
+
+    assert len(rows) == 2
+
+
+def test_visual_text_dedupe_merges_fragmented_tracks_without_ids() -> None:
+    pipe = PriceTagPipeline(
+        PipelineConfig(
+            enable_ocr=False,
+            dedupe_extended_time_window_ms=10000,
+            dedupe_visual_hash_threshold=4,
+            dedupe_text_similarity=0.80,
+        )
+    )
+    t1 = _track(1, 1000, [100, 100, 220, 210], {"product_name": "Молоко тест", "price_default": "129.99"})
+    t2 = _track(2, 5000, [118, 108, 238, 218], {"product_name": "Молоко тестовое", "price_default": "129.99"})
+    t1.observations[0].visual_hash = "0f0f0f0f0f0f0f0f"
+    t2.observations[0].visual_hash = "0f0f0f0f0f0f0f0e"
+    t1.observations[0].text = "Молоко тест 129 99"
+    t2.observations[0].text = "Молоко тестовое 129 99"
+
+    rows = pipe._tracks_to_rows([t1, t2])
+
+    assert len(rows) == 1
+
+
+def test_dedupe_keeps_conflicting_sku_separate() -> None:
+    pipe = PriceTagPipeline(PipelineConfig(enable_ocr=False))
+
+    rows = pipe._tracks_to_rows(
+        [
+            _track(1, 1000, [100, 100, 220, 210], {"id_sku": "270207736530"}),
+            _track(2, 1200, [104, 102, 224, 212], {"id_sku": "270207736531"}),
+        ]
+    )
+
+    assert len(rows) == 2
+
+
+def test_fallback_track_without_semantic_evidence_is_filtered() -> None:
+    det = Detection(100, 100, 220, 210, score=0.5, source="heuristic")
+    obs = TagObservation(
+        filename="shelf.mp4",
+        timestamp_ms=1000,
+        detection=det,
+        parsed={"color": "red"},
+        image_quality=100.0,
+    )
+    tr = Track(1, det, 1000)
+    tr.add(obs)
+    pipe = PriceTagPipeline(PipelineConfig(enable_ocr=False, enable_fallback_detectors=True))
+
+    rows = pipe._tracks_to_rows([tr])
+
+    assert rows == []
+
+
+def test_single_qr_seed_with_machine_id_is_kept() -> None:
+    det = Detection(100, 100, 220, 210, score=0.6, source="qr_seed")
+    obs = TagObservation(
+        filename="shelf.mp4",
+        timestamp_ms=1000,
+        detection=det,
+        parsed={"qr_code_barcode": "4670025474665"},
+        image_quality=100.0,
+    )
+    tr = Track(1, det, 1000)
+    tr.add(obs)
+    pipe = PriceTagPipeline(PipelineConfig(enable_ocr=False, enable_fallback_detectors=True))
+
+    rows = pipe._tracks_to_rows([tr])
+
+    assert len(rows) == 1
+    assert rows[0]["qr_code_barcode"] == "4670025474665"
+
+
+def test_single_fallback_with_product_only_is_filtered() -> None:
+    det = Detection(100, 100, 220, 210, score=0.5, source="red_white_tag")
+    obs = TagObservation(
+        filename="shelf.mp4",
+        timestamp_ms=1000,
+        detection=det,
+        parsed={"product_name": "Молоко тестовое"},
+        image_quality=100.0,
+    )
+    tr = Track(1, det, 1000)
+    tr.add(obs)
+    pipe = PriceTagPipeline(PipelineConfig(enable_ocr=False, enable_fallback_detectors=True))
+
+    rows = pipe._tracks_to_rows([tr])
+
+    assert rows == []

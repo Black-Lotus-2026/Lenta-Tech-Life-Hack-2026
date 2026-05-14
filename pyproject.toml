@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-full = ["ultralytics>=8.3.0", "paddleocr>=2.8.0", "paddlepaddle>=2.6.0", "zxing-cpp>=2.2.0", "onnxruntime>=1.18.0"]
+full = ["ultralytics>=8.3.0", "paddleocr>=2.8.0", "paddlepaddle>=2.6.0", "zxing-cpp>=2.2.0", "rapidfuzz>=3.9.0", "onnxruntime>=1.18.0"]
 
 [project.scripts]
 lenta-infer = "lenta_shelf_ai.pipeline:main"

@@ -110,6 +110,7 @@ class TagObservation:
     qr_payloads: List[str] = field(default_factory=list)
     parsed: Dict[str, Any] = field(default_factory=dict)
     image_quality: float = 0.0
+    visual_hash: str = ""
 
     def to_row(self) -> Dict[str, Any]:
         row = {col: "" for col in OUTPUT_COLUMNS}

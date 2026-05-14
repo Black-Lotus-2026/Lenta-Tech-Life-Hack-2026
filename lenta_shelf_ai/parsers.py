@@ -12,6 +12,8 @@ from .utils import normalize_text, price_to_str
 from .qr import parse_qr_payloads
 
 PRICE_RE = re.compile(r"(?<![\d./-])(\d{1,5})\s*[.,]\s*(\d{2})(?![\d./-])")
+PRICE_SPACED_RE = re.compile(r"(?<!\d)(\d{1,5})\s+(\d{2})(?!\d)")
+PRICE_COMPACT_RE = re.compile(r"(?<!\d)(\d{3,7})(?!\d)")
 DISCOUNT_RE = re.compile(r"[-−–]?\s*(\d{1,3})\s*%")
 DATE_RE = re.compile(r"(\d{2}[./-]\d{2}[./-]\d{4}\s+\d{1,2}:\d{2})")
 ZONE_RE = re.compile(r"(\d{2}_\d{6}\s*-\s*\d{6})")
@@ -67,24 +69,101 @@ def classify_color(crop_bgr: np.ndarray) -> str:
     return "red"
 
 
+def _looks_like_non_price_context(context: str) -> bool:
+    # Long identifiers around barcode/SKU/code labels should not become prices.
+    return bool(re.search(r"(?:штрих|barcode|баркод|артикул|sku|id[_\s-]*sku|qr|код)", context, re.I))
+
+
+def _unit_adjacent(text: str, start: int, end: int) -> bool:
+    # Reject 0.75L/500г/1 кг even if another price with "руб" is nearby.
+    local = text[max(0, start - 4) : min(len(text), end + 5)]
+    return bool(VOLUME_CONTEXT_RE.search(local))
+
+
+def _add_price(prices: List[str], integer_part: str, cents: str, context: str) -> None:
+    if not integer_part or not cents:
+        return
+    try:
+        value = float(f"{int(integer_part)}.{cents[:2]}")
+    except ValueError:
+        return
+    if value < 2.0 and not CURRENCY_CONTEXT_RE.search(context):
+        return
+    if value > 999999:
+        return
+    if _looks_like_non_price_context(context):
+        return
+    s = f"{value:.2f}"
+    if s not in prices:
+        prices.append(s)
+
+
 def _find_prices(text: str) -> List[str]:
-    prices = []
-    text = text.replace("\u00a0", " ")
+    prices: List[str] = []
+    text = normalize_text(text.replace("\u00a0", " "))
+    occupied: List[tuple[int, int]] = []
+
     for match in PRICE_RE.finditer(text):
-        a, b = match.group(1), match.group(2)
-        try:
-            value = float(f"{a}.{b}")
-        except ValueError:
+        if _unit_adjacent(text, match.start(), match.end()):
+            occupied.append(match.span())
             continue
-        context = text[max(0, match.start() - 12) : min(len(text), match.end() + 12)]
-        if value < 2.0 and VOLUME_CONTEXT_RE.search(context) and not CURRENCY_CONTEXT_RE.search(context):
+        context = text[max(0, match.start() - 18) : min(len(text), match.end() + 18)]
+        _add_price(prices, match.group(1), match.group(2), context)
+        occupied.append(match.span())
+
+    # OCR often splits big price "129 99" or "129\n99". Keep this after
+    # explicit decimal prices and require the integer part to be plausible.
+    for match in PRICE_SPACED_RE.finditer(text):
+        if any(not (match.end() <= a or match.start() >= b) for a, b in occupied):
             continue
-        if value < 2.0 and not CURRENCY_CONTEXT_RE.search(context):
+        integer_part, cents = match.group(1), match.group(2)
+        if len(integer_part) == 1 and int(integer_part) < 2:
             continue
-        if 0.01 <= value <= 999999:
-            s = f"{value:.2f}"
-            if s not in prices:
-                prices.append(s)
+        if _unit_adjacent(text, match.start(), match.end()):
+            occupied.append(match.span())
+            continue
+        context = text[max(0, match.start() - 18) : min(len(text), match.end() + 18)]
+        before_count = len(prices)
+        _add_price(prices, integer_part, cents, context)
+        if len(prices) > before_count:
+            occupied.append(match.span())
+
+    # Compact OCR "12999" -> 129.99, "378949" -> 3789.49.
+    for match in PRICE_COMPACT_RE.finditer(text):
+        if any(not (match.end() <= a or match.start() >= b) for a, b in occupied):
+            continue
+        raw = match.group(1)
+        if len(raw) < 4 or len(raw) > 7:
+            continue
+        if raw.startswith("0"):
+            continue
+        prev_ch = text[match.start() - 1] if match.start() > 0 else ""
+        next_ch = text[match.end()] if match.end() < len(text) else ""
+        if prev_ch in ".,/:;-" or next_ch in ".,/:;-":
+            continue
+        if _unit_adjacent(text, match.start(), match.end()):
+            continue
+        # Skip when embedded in dates/times or code-like contexts.
+        context = text[max(0, match.start() - 18) : min(len(text), match.end() + 18)]
+        if re.search(r"\d{1,2}[./-]\d{1,2}|[:]", context):
+            continue
+        _add_price(prices, raw[:-2], raw[-2:], context)
+
+    return prices
+
+
+def _find_prices_from_lines(lines: Sequence[OCRLine], full_text: str) -> List[str]:
+    prices = _find_prices(full_text)
+    # Additional line-pair recovery: OCR may output integer and cents as separate
+    # adjacent lines/tokens, which full-text normalization cannot distinguish from
+    # random IDs. Restrict to short numeric lines and local context.
+    texts = [normalize_text(line.text) for line in lines if normalize_text(line.text)]
+    for left, right in zip(texts, texts[1:]):
+        left_clean = normalize_text(left)
+        right_clean = normalize_text(right)
+        if re.fullmatch(r"\d{1,5}", left_clean) and re.fullmatch(r"\d{2}", right_clean):
+            context = f"{left_clean} {right_clean}"
+            _add_price(prices, left_clean, right_clean, context)
     return prices
 
 
@@ -118,7 +197,7 @@ def _candidate_product_lines(lines: Sequence[OCRLine]) -> List[str]:
             continue
         if bad.search(text):
             continue
-        if PRICE_RE.search(text) or DATE_RE.search(text) or ZONE_RE.search(text):
+        if _find_prices(text) or DATE_RE.search(text) or ZONE_RE.search(text):
             continue
         digits = sum(ch.isdigit() for ch in text)
         letters = sum(ch.isalpha() for ch in text)
@@ -153,17 +232,24 @@ def parse_text_fields(lines: Sequence[OCRLine], qr_fields: Dict[str, str], crop_
         fields.setdefault("price_discount", fields["action_price_qr"])
 
     # OCR prices, sorted by reading order/confidence. Use when QR missing.
-    prices = _find_prices(full_text_norm)
+    prices = _find_prices_from_lines(lines, full_text_norm)
     if prices:
-        fields.setdefault("price_default", prices[0])
-        if len(prices) >= 2:
-            # Smallest displayed price is often card/action; default is usually first/larger.
+        numeric_prices = []
+        for p in prices:
             try:
-                fields.setdefault("price_card", f"{min(float(p) for p in prices):.2f}")
+                numeric_prices.append(float(p))
             except Exception:
-                fields.setdefault("price_card", prices[1])
-        if len(prices) >= 3:
-            fields.setdefault("price_discount", prices[-1])
+                pass
+        if len(numeric_prices) >= 2:
+            # On promo tags the price without card is usually the larger one,
+            # while card/action price is the smaller highlighted one. This is
+            # more robust than OCR reading order on rotated retail video.
+            fields.setdefault("price_default", f"{max(numeric_prices):.2f}")
+            fields.setdefault("price_card", f"{min(numeric_prices):.2f}")
+        else:
+            fields.setdefault("price_default", prices[0])
+        if len(numeric_prices) >= 3:
+            fields.setdefault("price_discount", f"{min(numeric_prices):.2f}")
 
     discount = DISCOUNT_RE.search(full_text_norm)
     if discount:

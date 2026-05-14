@@ -76,3 +76,27 @@ def test_ensemble_ocr_disables_repeatedly_failing_engine(monkeypatch):
     assert [line.text for line in engine.recognize(image)] == ["Молоко"]
 
     assert broken.calls == 2
+
+
+def test_zonal_ocr_runs_full_and_local_zones_without_duplicates():
+    from lenta_shelf_ai.ocr import BaseOCREngine, EnsembleOCREngine
+    from lenta_shelf_ai.schema import OCRLine
+
+    class ZoneAwareEngine(BaseOCREngine):
+        engine = "zoneaware"
+
+        def recognize(self, image_bgr):
+            h, w = image_bgr.shape[:2]
+            if h < 80:
+                return [OCRLine(text="129 99", confidence=0.7, engine=self.engine)]
+            return [OCRLine(text="Товар тестовый", confidence=0.8, engine=self.engine)]
+
+    engine = EnsembleOCREngine(prefer_paddle=False)
+    engine.engines = [ZoneAwareEngine()]
+    image = np.full((120, 200, 3), 255, dtype=np.uint8)
+
+    lines = engine.recognize_zoned(image)
+
+    assert "Товар тестовый" in [line.text for line in lines]
+    assert "129 99" in [line.text for line in lines]
+    assert any("|zone:" in line.engine for line in lines)

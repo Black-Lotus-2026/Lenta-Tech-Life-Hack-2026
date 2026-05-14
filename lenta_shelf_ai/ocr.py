@@ -34,6 +34,55 @@ def enhance_crop(image_bgr: np.ndarray, max_side: int = 1600) -> np.ndarray:
     out = cv2.addWeighted(out, 1.45, blur, -0.45, 0)
     return out
 
+
+def _crop_zone(image_bgr: np.ndarray, box: tuple[float, float, float, float]) -> np.ndarray:
+    h, w = image_bgr.shape[:2]
+    x1, y1, x2, y2 = box
+    ix1 = max(0, min(w - 1, int(round(x1 * w))))
+    iy1 = max(0, min(h - 1, int(round(y1 * h))))
+    ix2 = max(0, min(w, int(round(x2 * w))))
+    iy2 = max(0, min(h, int(round(y2 * h))))
+    if ix2 <= ix1 or iy2 <= iy1:
+        return image_bgr[:0, :0].copy()
+    return image_bgr[iy1:iy2, ix1:ix2].copy()
+
+
+def split_price_tag_zones(image_bgr: np.ndarray) -> list[tuple[str, np.ndarray]]:
+    """Heuristic OCR zones for Lenta tags.
+
+    Full-crop OCR often spends capacity on QR/barcode texture and misses prices.
+    These zones intentionally overlap: product/name top area, price-dominant left
+    and right panels, and lower barcode/SKU/date strip. They require no template
+    labels and keep a full-crop fallback.
+    """
+    if image_bgr is None or image_bgr.size == 0:
+        return []
+    h, w = image_bgr.shape[:2]
+    if h < 24 or w < 24:
+        return [("full", image_bgr)]
+    zones = [
+        ("full", image_bgr),
+        ("product_top", _crop_zone(image_bgr, (0.00, 0.00, 1.00, 0.62))),
+        ("price_left", _crop_zone(image_bgr, (0.00, 0.18, 0.58, 0.92))),
+        ("price_right", _crop_zone(image_bgr, (0.42, 0.18, 1.00, 0.92))),
+        ("lower_codes", _crop_zone(image_bgr, (0.00, 0.55, 1.00, 1.00))),
+        ("center", _crop_zone(image_bgr, (0.12, 0.12, 0.88, 0.88))),
+    ]
+    out: list[tuple[str, np.ndarray]] = []
+    seen: set[tuple[int, int]] = set()
+    for name, crop in zones:
+        if crop is None or crop.size == 0:
+            continue
+        ch, cw = crop.shape[:2]
+        if ch < 18 or cw < 18:
+            continue
+        key = (ch, cw)
+        if name != "full" and key in seen:
+            continue
+        out.append((name, crop))
+        seen.add(key)
+    return out
+
 class BaseOCREngine:
     def recognize(self, image_bgr: np.ndarray) -> List[OCRLine]:
         raise NotImplementedError
@@ -187,7 +236,7 @@ class EnsembleOCREngine(BaseOCREngine):
         except Exception as exc:
             print(f"[WARN] Tesseract disabled: {exc}")
 
-    def recognize(self, image_bgr: np.ndarray) -> List[OCRLine]:
+    def _recognize_with_engines(self, image_bgr: np.ndarray) -> List[OCRLine]:
         all_lines: List[OCRLine] = []
         for idx, engine in enumerate(self.engines):
             if idx in self._disabled_engines:
@@ -200,13 +249,42 @@ class EnsembleOCREngine(BaseOCREngine):
                 if self._failure_counts[idx] >= self._max_engine_failures:
                     self._disabled_engines.add(idx)
                     print(f"[WARN] OCR engine {getattr(engine, 'engine', idx)} disabled after {self._failure_counts[idx]} failures")
-        # Keep high-confidence unique text first.
+        return all_lines
+
+    @staticmethod
+    def _dedupe_lines(lines: List[OCRLine]) -> List[OCRLine]:
         unique: List[OCRLine] = []
         seen = set()
-        for line in sorted(all_lines, key=lambda l: l.confidence, reverse=True):
+        for line in sorted(lines, key=lambda l: l.confidence, reverse=True):
             key = re.sub(r"\W+", "", line.text.lower())
             if not key or key in seen:
                 continue
             unique.append(line)
             seen.add(key)
         return unique
+
+    def recognize(self, image_bgr: np.ndarray) -> List[OCRLine]:
+        return self._dedupe_lines(self._recognize_with_engines(image_bgr))
+
+    def recognize_zoned(self, image_bgr: np.ndarray, max_zones: int = 6) -> List[OCRLine]:
+        """Run OCR on full crop plus local zones, then deduplicate.
+
+        Heavy engines are still optional and failure-isolated. Callers should use
+        this mostly with deferred OCR, because it multiplies OCR calls by zones.
+        """
+        all_lines: List[OCRLine] = []
+        for zone_name, zone_crop in split_price_tag_zones(image_bgr)[:max_zones]:
+            zone_lines = self._recognize_with_engines(zone_crop)
+            # Slightly downweight non-full duplicate zones, but keep them high
+            # enough to win when full-crop OCR misses a price/product token.
+            zone_weight = 1.0 if zone_name == "full" else 0.97
+            for line in zone_lines:
+                all_lines.append(
+                    OCRLine(
+                        text=line.text,
+                        confidence=float(line.confidence) * zone_weight,
+                        box=line.box,
+                        engine=f"{line.engine}|zone:{zone_name}",
+                    )
+                )
+        return self._dedupe_lines(all_lines)

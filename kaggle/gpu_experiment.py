@@ -415,6 +415,15 @@ def main() -> None:
     pipeline_max_detections = int(os.environ.get("EXP_PIPELINE_MAX_DETECTIONS", "120"))
     pipeline_max_frames = int(os.environ.get("EXP_PIPELINE_MAX_FRAMES", "0"))
     pipeline_save_crops = env_bool("EXP_PIPELINE_SAVE_CROPS", False)
+    pipeline_enable_zonal_ocr = env_bool("EXP_PIPELINE_ENABLE_ZONAL_OCR", True)
+    pipeline_qr_expansion_x = float(os.environ.get("EXP_PIPELINE_QR_EXPANSION_X", "0.55"))
+    pipeline_qr_expansion_y = float(os.environ.get("EXP_PIPELINE_QR_EXPANSION_Y", "0.45"))
+    pipeline_dedupe_visual_hash = int(os.environ.get("EXP_PIPELINE_DEDUPE_VISUAL_HASH", "14"))
+    pipeline_dedupe_text_similarity = float(os.environ.get("EXP_PIPELINE_DEDUPE_TEXT_SIMILARITY", "0.86"))
+    pipeline_dedupe_extended_window = int(os.environ.get("EXP_PIPELINE_DEDUPE_EXTENDED_WINDOW_MS", "12000"))
+    pipeline_dedupe_row_y_threshold = float(os.environ.get("EXP_PIPELINE_DEDUPE_ROW_Y_THRESHOLD", "0.55"))
+    pipeline_fallback_min_observations = int(os.environ.get("EXP_PIPELINE_FALLBACK_MIN_OBSERVATIONS", "3"))
+    pipeline_fallback_require_evidence = env_bool("EXP_PIPELINE_FALLBACK_REQUIRE_EVIDENCE", True)
     representative_temporal_weight = float(os.environ.get("EXP_REPRESENTATIVE_TEMPORAL_WEIGHT", "0.0"))
     recall_conf = float(os.environ.get("EXP_RECALL_CONF", "0.18"))
     recall_imgsz = int(os.environ.get("EXP_RECALL_IMGSZ", "1600"))
@@ -447,6 +456,15 @@ def main() -> None:
             "representative_temporal_weight": representative_temporal_weight,
             "save_crops": pipeline_save_crops,
             "save_debug_json": True,
+            "enable_zonal_ocr": pipeline_enable_zonal_ocr,
+            "qr_expansion_x": pipeline_qr_expansion_x,
+            "qr_expansion_y": pipeline_qr_expansion_y,
+            "dedupe_visual_hash_threshold": pipeline_dedupe_visual_hash,
+            "dedupe_text_similarity": pipeline_dedupe_text_similarity,
+            "dedupe_extended_time_window_ms": pipeline_dedupe_extended_window,
+            "dedupe_row_y_threshold_ratio": pipeline_dedupe_row_y_threshold,
+            "fallback_min_observations": pipeline_fallback_min_observations,
+            "fallback_require_evidence": pipeline_fallback_require_evidence,
         },
     )
 
@@ -534,6 +552,15 @@ def main() -> None:
             "max_detections_per_frame": pipeline_max_detections,
             "save_crops": pipeline_save_crops,
             "representative_temporal_weight": representative_temporal_weight,
+            "enable_zonal_ocr": pipeline_enable_zonal_ocr,
+            "qr_expansion_x": pipeline_qr_expansion_x,
+            "qr_expansion_y": pipeline_qr_expansion_y,
+            "dedupe_visual_hash_threshold": pipeline_dedupe_visual_hash,
+            "dedupe_text_similarity": pipeline_dedupe_text_similarity,
+            "dedupe_extended_time_window_ms": pipeline_dedupe_extended_window,
+            "dedupe_row_y_threshold_ratio": pipeline_dedupe_row_y_threshold,
+            "fallback_min_observations": pipeline_fallback_min_observations,
+            "fallback_require_evidence": pipeline_fallback_require_evidence,
         },
         "gpu_runtime": gpu_runtime,
         "best_weights": str(final_weights),

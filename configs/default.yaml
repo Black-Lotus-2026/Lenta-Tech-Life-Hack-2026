@@ -24,3 +24,12 @@ dedupe_time_window_ms: 1600
 representative_temporal_weight: 0.0
 save_crops: false
 save_debug_json: true
+enable_zonal_ocr: true
+qr_expansion_x: 0.55
+qr_expansion_y: 0.45
+dedupe_visual_hash_threshold: 14
+dedupe_text_similarity: 0.86
+dedupe_extended_time_window_ms: 12000
+dedupe_row_y_threshold_ratio: 0.55
+fallback_min_observations: 3
+fallback_require_evidence: true

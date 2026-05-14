@@ -32,15 +32,24 @@ def _qr_image_variants(image_bgr: np.ndarray) -> List[np.ndarray]:
     variants: List[np.ndarray] = [image_bgr]
     h, w = image_bgr.shape[:2]
     max_side = max(h, w)
-    if max_side < 450:
-        variants.append(cv2.resize(image_bgr, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC))
+
+    # QR modules in 4K retail crops are frequently below decoder sweet spot.
+    # Try bounded upscales of local regions before global threshold variants.
+    scale_factors: List[float] = []
+    if max_side < 180:
+        scale_factors = [2.0, 3.0, 4.0]
+    elif max_side < 450:
+        scale_factors = [1.7, 2.5, 3.2]
     elif max_side < 1200:
-        variants.append(cv2.resize(image_bgr, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC))
+        scale_factors = [1.5, 2.0]
+    for scale in scale_factors:
+        variants.append(cv2.resize(image_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC))
 
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(gray)
     blur = cv2.GaussianBlur(gray, (0, 0), 1.2)
-    sharp = cv2.addWeighted(gray, 1.7, blur, -0.7, 0)
+    sharp = cv2.addWeighted(gray, 1.8, blur, -0.8, 0)
+    _, otsu = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     adaptive = cv2.adaptiveThreshold(
         clahe,
         255,
@@ -49,15 +58,18 @@ def _qr_image_variants(image_bgr: np.ndarray) -> List[np.ndarray]:
         31,
         5,
     )
-    for single in [gray, clahe, sharp, adaptive]:
+    adaptive_inv = cv2.bitwise_not(adaptive)
+    for single in [gray, clahe, sharp, otsu, adaptive, adaptive_inv]:
         variants.append(cv2.cvtColor(single, cv2.COLOR_GRAY2BGR))
+
+    # Rotation variants cover phone/robot roll and vertical shelf labels.
     for rotated in [
         cv2.rotate(image_bgr, cv2.ROTATE_90_CLOCKWISE),
         cv2.rotate(image_bgr, cv2.ROTATE_180),
         cv2.rotate(image_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE),
     ]:
         variants.append(rotated)
-    for angle in (-12.0, 12.0):
+    for angle in (-15.0, -8.0, 8.0, 15.0):
         variants.append(_rotate_bound(image_bgr, angle))
     return variants
 
@@ -92,12 +104,12 @@ def _add_region(
     regions.append(np.ascontiguousarray(image_bgr[y1:y2, x1:x2]))
 
 
-def _qr_candidate_regions(image_bgr: np.ndarray) -> List[np.ndarray]:
-    """Return full tag plus likely QR sub-crops.
+def _qr_candidate_regions(image_bgr: np.ndarray, max_regions: int = 12) -> List[np.ndarray]:
+    """Return full tag plus likely QR/barcode sub-crops.
 
-    Lenta tags usually place QR/barcode data on the white half of the tag. On
-    robot video the QR may be only 50-90 px wide; isolating that region before
-    upscaling helps local decoders more than upscaling the whole price tag.
+    Lenta templates place QR/barcode payloads in either lower/right white
+    blocks or next to price panels. Returning only 2-3 regions was too lossy:
+    contour-discovered QR areas were silently truncated before decoding.
     """
     if image_bgr is None or image_bgr.size == 0:
         return []
@@ -106,43 +118,51 @@ def _qr_candidate_regions(image_bgr: np.ndarray) -> List[np.ndarray]:
     regions: List[np.ndarray] = [image_bgr]
     boxes: List[Tuple[int, int, int, int]] = [(0, 0, w, h)]
 
-    # Layout priors cover both horizontal and rotated shelf tags.
+    # Layout priors cover right/left QR placement, lower barcode strips, and
+    # rotated tags where a "lower" strip appears as a side strip.
     priors = [
-        (int(0.35 * w), int(0.15 * h), w, h),
-        (int(0.45 * w), int(0.30 * h), w, h),
-        (int(0.35 * w), int(0.45 * h), w, h),
-        (0, int(0.35 * h), int(0.65 * w), h),
-        (0, 0, int(0.65 * w), int(0.70 * h)),
+        (int(0.45 * w), 0, w, h),
+        (int(0.35 * w), int(0.10 * h), w, h),
+        (int(0.50 * w), int(0.35 * h), w, h),
+        (0, int(0.35 * h), int(0.70 * w), h),
+        (0, 0, int(0.70 * w), int(0.70 * h)),
+        (0, int(0.55 * h), w, h),
+        (0, 0, w, int(0.50 * h)),
+        (0, 0, int(0.50 * w), h),
+        (int(0.25 * w), int(0.25 * h), int(0.85 * w), int(0.90 * h)),
     ]
     for box in priors:
         _add_region(image_bgr, regions, boxes, box)
 
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(cv2.GaussianBlur(gray, (3, 3), 0), 45, 150)
-    dilated = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)), iterations=1)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(6, 6)).apply(gray)
+    edges = cv2.Canny(cv2.GaussianBlur(clahe, (3, 3), 0), 35, 140)
+    dilated = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)), iterations=1)
     contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     scored: List[Tuple[float, Tuple[int, int, int, int]]] = []
     for contour in contours:
         x, y, bw, bh = cv2.boundingRect(contour)
-        if bw < 20 or bh < 20 or bw > 0.85 * w or bh > 0.85 * h:
+        if bw < 16 or bh < 16 or bw > 0.90 * w or bh > 0.90 * h:
             continue
         aspect = bw / max(1, bh)
-        if not 0.45 <= aspect <= 2.0:
+        if not 0.35 <= aspect <= 2.8:
             continue
         roi_gray = gray[y : y + bh, x : x + bw]
         if roi_gray.size == 0:
             continue
-        edge_density = float(edges[y : y + bh, x : x + bw].mean() / 255.0)
-        dark_density = float((roi_gray < 120).mean())
-        if edge_density < 0.045 or dark_density < 0.04:
+        edge_density = float((edges[y : y + bh, x : x + bw] > 0).mean())
+        dark_density = float((roi_gray < 130).mean())
+        if edge_density < 0.030 or dark_density < 0.025:
             continue
-        pad = int(max(10, 0.45 * max(bw, bh)))
+        square_score = 1.0 - min(1.0, abs(aspect - 1.0))
+        pad = int(max(8, 0.55 * max(bw, bh)))
         area = (bw + 2 * pad) * (bh + 2 * pad)
-        scored.append((edge_density * dark_density * area, (x - pad, y - pad, x + bw + pad, y + bh + pad)))
-    for _, box in sorted(scored, reverse=True)[:8]:
+        score = (0.55 * edge_density + 0.35 * dark_density + 0.10 * square_score) * area
+        scored.append((score, (x - pad, y - pad, x + bw + pad, y + bh + pad)))
+    for _, box in sorted(scored, reverse=True)[: max(0, max_regions - len(regions)) + 4]:
         _add_region(image_bgr, regions, boxes, box)
 
-    return regions[:3]
+    return regions[:max_regions]
 
 
 def _has_structured_payload(payloads: List[str]) -> bool:
@@ -216,8 +236,14 @@ def decode_qr_payloads(image_bgr: np.ndarray) -> List[str]:
     except Exception:
         pass
 
-    # OpenCV QR detector.
+    # OpenCV QR detector. Use single, multi and curved variants because retail
+    # video crops can be skewed/warped by the robot perspective.
     detector = cv2.QRCodeDetector()
+    for setter in ("setEpsX", "setEpsY"):
+        try:
+            getattr(detector, setter)(0.2)
+        except Exception:
+            pass
     for im in variants:
         try:
             ok, decoded, points, _ = detector.detectAndDecodeMulti(im)
@@ -225,10 +251,20 @@ def decode_qr_payloads(image_bgr: np.ndarray) -> List[str]:
                 for text in decoded:
                     if text and text not in payloads:
                         payloads.append(text)
-            else:
-                text, _, _ = detector.detectAndDecode(im)
+            for method in ("detectAndDecode", "detectAndDecodeCurved"):
+                try:
+                    text, _, straight = getattr(detector, method)(im)
+                except Exception:
+                    continue
                 if text and text not in payloads:
                     payloads.append(text)
+                if straight is not None and getattr(straight, "size", 0):
+                    try:
+                        text2, _, _ = detector.detectAndDecode(cv2.cvtColor(straight, cv2.COLOR_GRAY2BGR) if straight.ndim == 2 else straight)
+                        if text2 and text2 not in payloads:
+                            payloads.append(text2)
+                    except Exception:
+                        pass
         except Exception:
             continue
     return payloads
@@ -286,11 +322,17 @@ def parse_qr_payload(payload: str) -> Dict[str, str]:
             if m:
                 data[key] = m.group(1)
 
+    # Decode aliases case-insensitively; payloads from QR generators are not
+    # consistent about camelCase/lowercase keys.
+    lower_data = {str(k).lower(): v for k, v in data.items()}
     normalized: Dict[str, str] = {}
     for target, aliases in QR_FIELD_ALIASES.items():
         for alias in aliases:
-            if alias in data and str(data[alias]).strip() != "":
-                val = str(data[alias]).strip()
+            source_val = data.get(alias)
+            if source_val is None:
+                source_val = lower_data.get(alias.lower())
+            if source_val is not None and str(source_val).strip() != "":
+                val = str(source_val).strip()
                 if "price" in target or target.endswith("_price") or target.startswith("price") or target == "action_price_qr":
                     val = price_to_str(val)
                 normalized[target] = val

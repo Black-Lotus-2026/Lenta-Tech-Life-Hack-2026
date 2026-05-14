@@ -53,3 +53,30 @@ def test_parser_rejects_non_cyrillic_product_garbage():
 
 def test_merge_canonicalizes_greek_absent_noise():
     assert merge_field_values(["\u03bd\u03b5\u03c2", "нет"]) == "нет"
+
+
+def test_text_parser_recovers_compact_and_spaced_prices():
+    lines = [
+        OCRLine("Вино тестовое красное"),
+        OCRLine("378949"),
+        OCRLine("2345 99"),
+        OCRLine("-38%"),
+    ]
+
+    out = parse_text_fields(lines, {})
+
+    assert out["price_default"] == "3789.49"
+    assert out["price_card"] == "2345.99"
+    assert out["discount_amount"] == "-38%"
+
+
+def test_text_parser_does_not_turn_long_ids_into_compact_prices():
+    lines = [
+        OCRLine("id_sku 270207736530"),
+        OCRLine("Штрих код 4670025474665"),
+        OCRLine("Товар тестовый"),
+    ]
+
+    out = parse_text_fields(lines, {})
+
+    assert "price_default" not in out
