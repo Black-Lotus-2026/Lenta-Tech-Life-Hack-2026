@@ -193,7 +193,20 @@ python scripts/evaluate_on_public.py \
 
 ---
 
-## 7. Docker
+## 7. Google Colab эксперименты
+
+Если Kaggle GPU-квота исчерпана, можно запускать те же эксперименты в Colab:
+
+- `colab/lenta_colab_exp_a_fallback_gated.ipynb` - быстрый detector/fallback diagnostic без OCR/QR;
+- `colab/lenta_colab_exp_b_zonal_qr_ocr.ipynb` - основной quality-run с QR cascade, zonal OCR, parser и dedupe;
+- `colab/lenta_colab_exp_c_selftrain_detector.ipynb` - self-training detector на pseudo-labels;
+- `colab/lenta_colab_compare_runs.ipynb` - сравнение сохраненных artifacts из Google Drive.
+
+Ноутбуки скачивают Kaggle dataset `whitenigger/lenta-shelf-ai-bundle`, запускают локальный `kaggle/gpu_experiment.py`, сохраняют artifacts в `MyDrive/lenta_colab_runs` и не используют cloud OCR/API/LLM для inference.
+
+---
+
+## 8. Docker
 
 ```bash
 docker build -t lenta-shelf-ai .
@@ -204,7 +217,7 @@ docker run --rm -p 7860:7860 -v "$PWD/models:/app/models" lenta-shelf-ai
 
 ---
 
-## 8. Деплой
+## 9. Деплой
 
 Рекомендуемый путь для демо: **Hugging Face Spaces Docker**.
 
