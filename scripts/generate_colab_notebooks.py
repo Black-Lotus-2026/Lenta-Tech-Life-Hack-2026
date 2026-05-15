@@ -22,8 +22,8 @@ from pathlib import Path
 
 DATASET = "whitenigger/lenta-shelf-ai-bundle"
 BUNDLE_DIR = Path("/content/lenta_bundle")
-KAGGLE_INPUT = Path("/kaggle/input/lenta-shelf-ai-bundle")
-KAGGLE_WORKING = Path("/kaggle/working")
+KAGGLE_INPUT = Path("/content/kaggle/input/lenta-shelf-ai-bundle")
+KAGGLE_WORKING = Path("/content/kaggle/working")
 RUN_TS = time.strftime("%Y%m%d_%H%M%S")
 DRIVE_ROOT = Path("/content/drive/MyDrive/lenta_colab_runs")
 
@@ -129,6 +129,13 @@ def prepare_bundle():
         script = runner_root / "repo" / "kaggle" / "gpu_experiment.py"
     if not script.exists():
         raise FileNotFoundError(script)
+    # The runner is shared with Kaggle and hardcodes /kaggle/input and
+    # /kaggle/working. In Colab those paths can be read-only or absent, so run a
+    # Colab-local patched copy while keeping the repository source unchanged.
+    source = script.read_text(encoding="utf-8")
+    source = source.replace('Path("/kaggle/input")', 'Path("/content/kaggle/input")')
+    source = source.replace('Path("/kaggle/working/artifacts")', 'Path("/content/kaggle/working/artifacts")')
+    script.write_text(source, encoding="utf-8")
     print("[OK] runner:", script)
     return script
 
