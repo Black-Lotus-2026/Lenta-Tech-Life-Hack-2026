@@ -86,23 +86,47 @@ def prepare_bundle():
     run([sys.executable, "-m", "pip", "install", "-q", "kaggle"])
     setup_kaggle_credentials()
     BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
-    if not (BUNDLE_DIR / "repo.zip").exists() or not (BUNDLE_DIR / "data.zip").exists():
+    if not (BUNDLE_DIR / "repo.zip").exists() and not (BUNDLE_DIR / "repo").exists():
         run(["kaggle", "datasets", "download", "-d", DATASET, "-p", str(BUNDLE_DIR), "--unzip"])
-    if not (BUNDLE_DIR / "repo.zip").exists() or not (BUNDLE_DIR / "data.zip").exists():
-        raise FileNotFoundError(f"Expected repo.zip and data.zip in {BUNDLE_DIR}")
+
+    print("[BUNDLE_FILES]", [str(p.relative_to(BUNDLE_DIR)) for p in sorted(BUNDLE_DIR.glob("**/*"))[:80]])
+    repo_zip = next(iter(BUNDLE_DIR.glob("**/repo.zip")), None)
+    data_zip = next(iter(BUNDLE_DIR.glob("**/data.zip")), None)
+    repo_dir = next((p for p in BUNDLE_DIR.glob("**/repo") if p.is_dir()), None)
+    data_dir = next((p for p in BUNDLE_DIR.glob("**/data") if p.is_dir()), None)
+    if repo_dir is None:
+        repo_candidates = [p.parent for p in BUNDLE_DIR.glob("**/kaggle/gpu_experiment.py")]
+        repo_dir = repo_candidates[0] if repo_candidates else None
+    if data_dir is None:
+        data_candidates = [p.parent.parent for p in BUNDLE_DIR.glob("**/*/*.mp4") if "repo" not in p.parts]
+        data_dir = data_candidates[0] if data_candidates else None
+    if repo_zip is None and repo_dir is None:
+        raise FileNotFoundError(f"Cannot find repo.zip or repo folder in {BUNDLE_DIR}")
+    if data_zip is None and data_dir is None:
+        raise FileNotFoundError(f"Cannot find data.zip or data folder in {BUNDLE_DIR}")
 
     KAGGLE_INPUT.mkdir(parents=True, exist_ok=True)
     KAGGLE_WORKING.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(BUNDLE_DIR / "repo.zip", KAGGLE_INPUT / "repo.zip")
-    shutil.copy2(BUNDLE_DIR / "data.zip", KAGGLE_INPUT / "data.zip")
+    if repo_zip is not None:
+        shutil.copy2(repo_zip, KAGGLE_INPUT / "repo.zip")
+    else:
+        shutil.copytree(repo_dir, KAGGLE_INPUT / "repo", dirs_exist_ok=True)
+    if data_zip is not None:
+        shutil.copy2(data_zip, KAGGLE_INPUT / "data.zip")
+    else:
+        shutil.copytree(data_dir, KAGGLE_INPUT / "data", dirs_exist_ok=True)
 
     runner_root = Path("/content/lenta_runner_repo")
     if runner_root.exists():
         shutil.rmtree(runner_root)
     runner_root.mkdir(parents=True)
-    with zipfile.ZipFile(BUNDLE_DIR / "repo.zip") as zf:
-        zf.extractall(runner_root)
-    script = runner_root / "repo" / "kaggle" / "gpu_experiment.py"
+    if repo_zip is not None:
+        with zipfile.ZipFile(repo_zip) as zf:
+            zf.extractall(runner_root)
+        script = runner_root / "repo" / "kaggle" / "gpu_experiment.py"
+    else:
+        shutil.copytree(repo_dir, runner_root / "repo", dirs_exist_ok=True)
+        script = runner_root / "repo" / "kaggle" / "gpu_experiment.py"
     if not script.exists():
         raise FileNotFoundError(script)
     print("[OK] runner:", script)

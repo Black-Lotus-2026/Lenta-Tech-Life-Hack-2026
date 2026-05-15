@@ -8,6 +8,7 @@ Open from GitHub:
 - [Experiment A: fallback gated detector diagnostic](https://colab.research.google.com/github/Black-Lotus-2026/Lenta-Tech-Life-Hack-2026/blob/main/colab/lenta_colab_exp_a_fallback_gated.ipynb)
 - [Experiment B: zonal QR/OCR quality run](https://colab.research.google.com/github/Black-Lotus-2026/Lenta-Tech-Life-Hack-2026/blob/main/colab/lenta_colab_exp_b_zonal_qr_ocr.ipynb)
 - [Experiment B v2 fixed: zonal QR/OCR quality run](https://colab.research.google.com/github/Black-Lotus-2026/Lenta-Tech-Life-Hack-2026/blob/main/colab/lenta_colab_exp_b_zonal_qr_ocr_v2_fixed.ipynb)
+- [Experiment B v3 bundlefix: zonal QR/OCR quality run](https://colab.research.google.com/github/Black-Lotus-2026/Lenta-Tech-Life-Hack-2026/blob/main/colab/lenta_colab_exp_b_zonal_qr_ocr_v3_bundlefix.ipynb)
 - [Experiment C: self-training detector run](https://colab.research.google.com/github/Black-Lotus-2026/Lenta-Tech-Life-Hack-2026/blob/main/colab/lenta_colab_exp_c_selftrain_detector.ipynb)
 - [Compare saved Colab runs](https://colab.research.google.com/github/Black-Lotus-2026/Lenta-Tech-Life-Hack-2026/blob/main/colab/lenta_colab_compare_runs.ipynb)
 
