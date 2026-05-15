@@ -252,6 +252,15 @@ class PriceTagPipeline:
                 {
                     "track_id": tr.track_id,
                     "observations": len(tr.observations),
+                    "trajectory": [
+                        {
+                            "timestamp_ms": int(obs.timestamp_ms),
+                            "bbox": [round(float(v), 1) for v in obs.detection.xyxy],
+                            "score": round(float(obs.detection.score), 4),
+                            "source": obs.detection.source,
+                        }
+                        for obs in sorted(tr.observations, key=lambda item: int(item.timestamp_ms))
+                    ],
                     "best_timestamp_ms": int(best.timestamp_ms),
                     "best_bbox": [round(float(v), 1) for v in best.detection.xyxy],
                     "best_score": round(float(best.detection.score), 4),

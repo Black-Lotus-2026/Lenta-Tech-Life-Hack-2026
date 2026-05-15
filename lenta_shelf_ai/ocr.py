@@ -13,9 +13,82 @@ from .schema import OCRLine
 from .utils import normalize_text
 
 
-def enhance_crop(image_bgr: np.ndarray, max_side: int = 1600) -> np.ndarray:
+def suppress_code_artifacts(image_bgr: np.ndarray) -> np.ndarray:
+    """Mask dense QR/barcode-like regions for OCR only.
+
+    QR and 1D barcodes are decoded from the original crop before OCR. For OCR,
+    their high-frequency black modules often dominate thresholding and create
+    garbage tokens. This conservative mask targets dense machine-code blocks on
+    the right/lower part of the tag and leaves normal text/price areas intact.
+    """
     if image_bgr is None or image_bgr.size == 0:
         return image_bgr
+    h, w = image_bgr.shape[:2]
+    if h < 40 or w < 40:
+        return image_bgr
+
+    out = image_bgr.copy()
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    dark = cv2.inRange(gray, 0, 120)
+    edges = cv2.Canny(gray, 45, 160)
+    texture = cv2.bitwise_or(dark, edges)
+    texture = cv2.morphologyEx(texture, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
+    contours, _ = cv2.findContours(texture, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    small_code_boxes: list[tuple[int, int, int, int]] = []
+
+    for contour in contours:
+        x, y, bw, bh = cv2.boundingRect(contour)
+        if bw < 6 or bh < 6:
+            continue
+        area_ratio = (bw * bh) / max(1.0, float(w * h))
+        if not 0.002 <= area_ratio <= 0.45:
+            continue
+        roi_dark = dark[y : y + bh, x : x + bw]
+        roi_edges = edges[y : y + bh, x : x + bw]
+        dark_density = float((roi_dark > 0).mean())
+        edge_density = float((roi_edges > 0).mean())
+        aspect = bw / max(1, bh)
+
+        right_or_lower = x > 0.42 * w or y > 0.48 * h
+        qr_like = 0.55 <= aspect <= 1.85 and dark_density >= 0.16 and edge_density >= 0.045
+        barcode_like = (
+            (aspect >= 2.8 or aspect <= 0.36)
+            and dark_density >= 0.11
+            and edge_density >= 0.040
+            and (y > 0.45 * h or x > 0.50 * w)
+        )
+        if right_or_lower and qr_like and area_ratio >= 0.002:
+            small_code_boxes.append((x, y, x + bw, y + bh))
+        if not right_or_lower or not (qr_like or barcode_like):
+            continue
+
+        pad = max(2, int(0.03 * max(bw, bh)))
+        x1, y1 = max(0, x - pad), max(0, y - pad)
+        x2, y2 = min(w, x + bw + pad), min(h, y + bh + pad)
+        bg = np.percentile(out.reshape(-1, 3), 88, axis=0).astype(np.uint8).tolist()
+        cv2.rectangle(out, (x1, y1), (x2, y2), bg, thickness=-1)
+    if len(small_code_boxes) >= 6:
+        x1 = min(box[0] for box in small_code_boxes)
+        y1 = min(box[1] for box in small_code_boxes)
+        x2 = max(box[2] for box in small_code_boxes)
+        y2 = max(box[3] for box in small_code_boxes)
+        bw, bh = x2 - x1, y2 - y1
+        area_ratio = (bw * bh) / max(1.0, float(w * h))
+        aspect = bw / max(1, bh)
+        if 0.01 <= area_ratio <= 0.45 and 0.45 <= aspect <= 2.2 and (x1 > 0.42 * w or y1 > 0.45 * h):
+            pad = max(2, int(0.025 * max(bw, bh)))
+            x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
+            x2, y2 = min(w, x2 + pad), min(h, y2 + pad)
+            bg = np.percentile(out.reshape(-1, 3), 88, axis=0).astype(np.uint8).tolist()
+            cv2.rectangle(out, (x1, y1), (x2, y2), bg, thickness=-1)
+    return out
+
+
+def enhance_crop(image_bgr: np.ndarray, max_side: int = 1600, suppress_artifacts: bool = True) -> np.ndarray:
+    if image_bgr is None or image_bgr.size == 0:
+        return image_bgr
+    if suppress_artifacts:
+        image_bgr = suppress_code_artifacts(image_bgr)
     h, w = image_bgr.shape[:2]
     scale = 1.0
     if max(h, w) < 650:

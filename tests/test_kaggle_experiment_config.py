@@ -15,6 +15,7 @@ def _defaults(kernel_dir: str) -> dict[str, str]:
 def test_detector_diagnostic_kernel_disables_qr_to_avoid_native_crashes() -> None:
     defaults = _defaults("kernel_exp_a")
 
+    assert defaults["EXP_MODEL"] == "yolov8n.pt"
     assert defaults["EXP_PIPELINE_ENABLE_OCR"] == "0"
     assert defaults["EXP_PIPELINE_ENABLE_QR"] == "0"
     assert defaults["EXP_PIPELINE_ENABLE_FALLBACKS"] == "1"

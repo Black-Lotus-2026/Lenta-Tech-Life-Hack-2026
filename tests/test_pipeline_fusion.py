@@ -168,3 +168,22 @@ def test_single_fallback_with_product_only_is_filtered() -> None:
     rows = pipe._tracks_to_rows([tr])
 
     assert rows == []
+
+
+def test_tracks_debug_exports_coordinate_trajectory() -> None:
+    pipe = PriceTagPipeline(PipelineConfig(enable_ocr=False))
+    tr = _track(1, 1000, [100, 100, 220, 210])
+    tr.add(
+        TagObservation(
+            filename="shelf.mp4",
+            timestamp_ms=1500,
+            detection=Detection(106, 102, 226, 212, score=0.7, source="yolo"),
+            image_quality=120.0,
+        )
+    )
+
+    debug = pipe._tracks_debug([tr])
+
+    assert debug[0]["track_id"] == 1
+    assert [point["timestamp_ms"] for point in debug[0]["trajectory"]] == [1000, 1500]
+    assert debug[0]["trajectory"][1]["bbox"] == [106.0, 102.0, 226.0, 212.0]

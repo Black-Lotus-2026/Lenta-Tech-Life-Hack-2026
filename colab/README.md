@@ -17,6 +17,8 @@ Runtime requirements:
   `KAGGLE_USERNAME` and `KAGGLE_KEY`.
 - The notebooks download `whitenigger/lenta-shelf-ai-bundle`, run local
   dependencies only, and save artifacts to `MyDrive/lenta_colab_runs`.
+- Current bundled detector expected by the notebooks is YOLOv8n at
+  `models/price_tag_yolo.pt`.
 
 Run order:
 

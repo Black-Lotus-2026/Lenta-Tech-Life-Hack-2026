@@ -19,11 +19,11 @@ EXPERIMENTS = [
         "id": "whitenigger/lenta-shelf-ai-exp-a",
         "title": "Lenta Shelf AI Exp A",
         "defaults": {
-            "EXP_NAME": "exp-a-hardened-fallback-gated-4fps-conf008",
+            "EXP_NAME": "exp-a-yolov8n-fallback-gated-4fps-conf008",
             "EXP_REQUIRE_GPU_NAME": "T4",
             "EXP_REQUIRE_GPU_COUNT": "2",
             "EXP_DEVICE": "0",
-            "EXP_MODEL": "yolo11n.pt",
+            "EXP_MODEL": "yolov8n.pt",
             "EXP_EPOCHS": "0",
             "EXP_IMGSZ": "1280",
             "EXP_BATCH": "4",
@@ -55,7 +55,7 @@ EXPERIMENTS = [
         "id": "whitenigger/lenta-shelf-ai-exp-b",
         "title": "Lenta Shelf AI Exp B",
         "defaults": {
-            "EXP_NAME": "exp-b-hardened-zonalqr-dedupe-4fps",
+            "EXP_NAME": "exp-b-yolov8n-zonalqr-dedupe-4fps",
             "EXP_REQUIRE_GPU_NAME": "T4",
             "EXP_REQUIRE_GPU_COUNT": "2",
             "EXP_DEVICE": "0",

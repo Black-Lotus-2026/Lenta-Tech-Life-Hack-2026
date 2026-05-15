@@ -316,7 +316,7 @@ def main() -> None:
     epochs = int(os.environ.get("EXP_EPOCHS", "80"))
     imgsz = int(os.environ.get("EXP_IMGSZ", "1280"))
     batch = int(os.environ.get("EXP_BATCH", "4"))
-    base_model = os.environ.get("EXP_MODEL", "yolo11n.pt")
+    base_model = os.environ.get("EXP_MODEL", "yolov8n.pt")
     device = os.environ.get("EXP_DEVICE", "0,1")
     experiment_name = os.environ.get("EXP_NAME", "manual")
     best = final_weights

@@ -89,17 +89,19 @@ python scripts/build_yolo_dataset.py \
 ```bash
 python scripts/train_detector.py \
   --data datasets/lenta_yolo/data.yaml \
-  --model yolo11n.pt \
-  --epochs 150 \
+  --model yolov8n.pt \
+  --epochs 120 \
   --imgsz 1280 \
-  --batch 4 \
+  --batch 6 \
   --device 0
 
 mkdir -p models
-cp runs/lenta/price_tag_yolo/weights/best.pt models/price_tag_yolo.pt
+cp runs/lenta/yolov8n_lenta/weights/best.pt models/price_tag_yolo.pt
 ```
 
 Если GPU нет, можно поставить `--device cpu --epochs 50`, но качество будет ниже.
+
+Текущий detector artifact: YOLOv8n `yolov8n_lenta_20260514_145955`, best validation row: epoch 12, precision `0.71522`, recall `0.89223`, mAP50 `0.75548`, mAP50-95 `0.28991`. Детали: `docs/yolov8n_detector_20260514.md`.
 
 ### 3.5 Self-training без ручной разметки
 
@@ -166,14 +168,14 @@ action_price_qr, action_code_qr
 
 1. **Sampling**: 4K MP4 читается с частотой 2-4 FPS, размазанные кадры отсекаются по Laplacian sharpness.
 2. **Detection**:
-   - основной детектор: дообученный YOLO11n/YOLOv8n;
+   - основной детектор: дообученный YOLOv8n;
    - QR-seed: если QR найден раньше ценника, область расширяется до всего ценника;
    - HSV fallback: красные/желтые/зеленые ценники и edge-density фильтрация.
-3. **Crop enhancement**: upscale, CLAHE, unsharp mask.
+3. **Crop enhancement**: upscale, CLAHE, unsharp mask, OCR-only masking of dense QR/barcode-like artifacts.
 4. **QR/barcode**: zxing-cpp -> pyzbar -> OpenCV QR. QR-поля имеют приоритет над OCR.
-5. **OCR**: PaddleOCR для accuracy-режима, Tesseract rus+eng fallback для CPU-safe.
+5. **OCR**: PaddleOCR для accuracy-режима, Tesseract rus+eng fallback для CPU-safe, zonal OCR over product/price/code regions.
 6. **Parsing**: регулярные выражения и доменные правила для цен, скидки, EAN-13, SKU, даты печати, кода зоны, special symbols, цвета.
-7. **Temporal fusion**: один ценник объединяется по треку/QR/barcode/product+price; выбирается лучший crop по QR/OCR/sharpness. В режиме `defer_ocr` OCR/QR выполняются после трекинга только для representative crop.
+7. **Temporal fusion**: один ценник объединяется по треку/QR/barcode/product+price; выбирается лучший crop по QR/OCR/sharpness. Debug JSON сохраняет trajectory координат каждого track. В режиме `defer_ocr` OCR/QR выполняются после трекинга только для representative crop.
 8. **CSV export**: фиксированная схема Lenta Tech.
 
 Схема и критика подробно описаны в `docs/architecture.md` и `docs/self_critique.md`.

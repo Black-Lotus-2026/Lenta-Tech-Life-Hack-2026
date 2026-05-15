@@ -100,3 +100,28 @@ def test_zonal_ocr_runs_full_and_local_zones_without_duplicates():
     assert "Товар тестовый" in [line.text for line in lines]
     assert "129 99" in [line.text for line in lines]
     assert any("|zone:" in line.engine for line in lines)
+
+
+def test_suppress_code_artifacts_masks_dense_qr_block_but_keeps_text_area():
+    import cv2
+
+    from lenta_shelf_ai.ocr import suppress_code_artifacts
+
+    image = np.full((120, 220, 3), 245, dtype=np.uint8)
+    # Text-like strokes on the left should stay dark.
+    cv2.putText(image, "129", (12, 72), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 3)
+    # Dense QR-like block on the right should be suppressed for OCR.
+    for y in range(25, 95, 10):
+        for x in range(150, 205, 10):
+            if ((x // 10) + (y // 10)) % 2 == 0:
+                cv2.rectangle(image, (x, y), (x + 7, y + 7), (0, 0, 0), -1)
+
+    cleaned = suppress_code_artifacts(image)
+
+    left_before = image[35:85, 8:85].mean()
+    left_after = cleaned[35:85, 8:85].mean()
+    qr_before = image[25:95, 150:205].mean()
+    qr_after = cleaned[25:95, 150:205].mean()
+
+    assert qr_after > qr_before + 20
+    assert abs(left_after - left_before) < 12
