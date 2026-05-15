@@ -226,6 +226,16 @@ def notebook(cells: list[dict[str, object]]) -> dict[str, object]:
 
 
 def experiment_notebook(title: str, purpose: str, env: dict[str, str], critique: str) -> dict[str, object]:
+    run_cell = (
+        f"EXP_ENV = {json.dumps(env, indent=4)}\n"
+        'EXPERIMENT_NAME = EXP_ENV["EXP_NAME"]\n\n'
+        "setup_drive()\n"
+        "script = prepare_bundle()\n"
+        "artifacts = run_experiment(script, EXP_ENV)\n"
+        "run_error_analysis()\n"
+        "run_dir = save_artifacts(artifacts, EXPERIMENT_NAME)\n"
+        "print_key_reports(artifacts)\n"
+    )
     return notebook(
         [
             markdown_cell(
@@ -248,19 +258,7 @@ def experiment_notebook(title: str, purpose: str, env: dict[str, str], critique:
                 """
             ),
             code_cell(COMMON_SETUP),
-            code_cell(
-                f"""
-                EXP_ENV = {json.dumps(env, indent=4)}
-                EXPERIMENT_NAME = EXP_ENV["EXP_NAME"]
-
-                setup_drive()
-                script = prepare_bundle()
-                artifacts = run_experiment(script, EXP_ENV)
-                run_error_analysis()
-                run_dir = save_artifacts(artifacts, EXPERIMENT_NAME)
-                print_key_reports(artifacts)
-                """
-            ),
+            code_cell(run_cell),
             markdown_cell(
                 f"""
                 ## Required critique after run
