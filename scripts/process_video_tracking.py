@@ -1,15 +1,20 @@
+# -*- coding: utf-8 -*-
+
 import argparse
 import logging
 import pathlib
 import re
+from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import cv2
-import easyocr
 import numpy as np
 import pandas as pd
+
 from ultralytics import YOLO
+from paddleocr import PaddleOCR
 
 try:
     from pyzbar.pyzbar import decode as pyzbar_decode
@@ -17,9 +22,33 @@ except Exception:
     pyzbar_decode = None
 
 
-logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-logger = logging.getLogger("video-tracking")
+# ============================================================
+# LOGGING (с временем)
+# ============================================================
 
+class TimeFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        ct = datetime.fromtimestamp(record.created)
+        if datefmt:
+            return ct.strftime(datefmt)
+        return ct.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+for handler in logging.root.handlers:
+    handler.setFormatter(
+        TimeFormatter("[%(asctime)s.%(msecs)03d] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+
+logger = logging.getLogger("tracking")
+
+# ============================================================
+# CONSTANTS
+# ============================================================
 
 EXPECTED_COLUMNS = [
     "filename",
@@ -53,7 +82,7 @@ EXPECTED_COLUMNS = [
     "action_code_qr",
 ]
 
-MODEL_CLASSES = [
+FIELD_CLASSES = {
     "additional_info",
     "barcode",
     "code",
@@ -65,20 +94,19 @@ MODEL_CLASSES = [
     "print_datetime",
     "product_name",
     "qr_code_barcode",
-]
-
-ANCHOR_CLASSES = {
-    "price_card",
-    "price_default",
-    "price_discount",
-    "product_name",
-    "barcode",
-    "qr_code_barcode",
-    "id_sku",
 }
 
-QRCODE_CLASSES = {"qr_code_barcode", "barcode", "code"}
+# FIX: Поля, которые обрабатываются редко (не каждый кадр)
+RARE_FIELDS = {"product_name", "additional_info", "code", "discount_amount", "id_sku", "print_datetime"}
+# FIX: Поля цен - обрабатываем чаще, но не каждый кадр
+PRICE_FIELDS = {"price_card", "price_default", "price_discount"}
+# FIX: QR и штрихкод - каждый кадр
+QR_FIELDS = {"qr_code_barcode", "barcode"}
 
+
+# ============================================================
+# DATA CLASSES
+# ============================================================
 
 @dataclass
 class Detection:
@@ -95,601 +123,560 @@ class TrackState:
     last_frame: int
     last_bbox: Tuple[int, int, int, int]
     best_score: float = -1.0
-    best_frame_idx: int = -1
-    best_frame_img: Optional[np.ndarray] = None
-    best_bbox: Optional[Tuple[int, int, int, int]] = None
-    color: str = "нет"
-    fields: Dict[str, Tuple[str, float]] = field(default_factory=dict)
+    field_votes: Dict[str, List[Tuple[str, float]]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+    # FIX: последний кадр, когда обрабатывали каждое поле
+    last_processed_frame: Dict[str, int] = field(default_factory=dict)
+    # FIX: счётчик пропущенных кадров (для удаления старых треков)
+    lost_counter: int = 0
 
 
-def resolve_project_root() -> pathlib.Path:
+# ============================================================
+# OCR (ИНИЦИАЛИЗАЦИЯ)
+# ============================================================
+
+logger.info("Инициализация PaddleOCR (это может занять время)...")
+try:
+    ocr = PaddleOCR(
+        lang='ru',
+        use_angle_cls=True,
+        show_log=False
+    )
+    logger.info("PaddleOCR успешно инициализирован")
+except Exception as e:
+    logger.error(f"Ошибка инициализации PaddleOCR: {e}")
+    ocr = None
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def resolve_project_root():
     start = pathlib.Path.cwd().resolve()
-    for c in [start, *start.parents]:
-        if (c / "notebook").exists() and (c / "data").exists():
-            return c
+    for p in [start, *start.parents]:
+        if (p / "data").exists():
+            return p
     return start
 
 
-def load_sr_model(project_root: pathlib.Path):
-    sr = cv2.dnn_superres.DnnSuperResImpl_create()
-    candidates = [
-        project_root / "weight" / "ESPCN_x4.pb",
-        project_root / "weights" / "ESPCN_x4.pb",
-        pathlib.Path("weight/ESPCN_x4.pb"),
-        pathlib.Path("weights/ESPCN_x4.pb"),
-    ]
-    for p in candidates:
-        if p.exists():
-            try:
-                sr.readModel(str(p))
-                sr.setModel("espcn", 4)
-                logger.info("ESPCN loaded: %s", p)
-                return sr
-            except Exception as e:
-                logger.warning("ESPCN load failed (%s): %s", p, e)
-    logger.warning("ESPCN model not found, fallback without SR")
-    return None
-
-# Thresholds and tuning
-SHARPNESS_THRESHOLD = 80.0  # below this, skip OCR on crop
-MIN_CROP_AREA_FOR_OCR = 28 * 28  # require minimal area for OCR
+def laplacian_score(img):
+    if img is None or img.size == 0:
+        return 0
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return cv2.Laplacian(gray, cv2.CV_64F).var()
 
 
-def enhance_crop(crop: np.ndarray, sr_model) -> np.ndarray:
-    if crop is None or crop.size == 0:
-        return crop
-    if sr_model is None:
-        return crop
-    h, w = crop.shape[:2]
-    if h < 24 or w < 24:
-        return crop
-    try:
-        return sr_model.upsample(crop)
-    except Exception:
-        return crop
+def clean_text(txt):
+    if txt is None:
+        return ""
+    txt = str(txt)
+    txt = txt.replace("\n", " ").replace("\t", " ")
+    txt = re.sub(r"\s+", " ", txt)
+    txt = re.sub(r'[^\w\s\.,\-\(\)№%]', '', txt)
+    return txt.strip()
 
 
-def clean_price(text: str) -> str:
+def clean_price(text):
     if not text:
         return ""
-    m = re.search(r"\d+[\d\s]*[.,]?\d{0,2}", text.replace("\xa0", " "))
-    if not m:
-        return ""
-    return m.group(0).replace(" ", "").replace(",", ".")
-
-
-def clean_date(text: str) -> str:
-    if not text:
-        return ""
-    patterns = [r"\d{2}[./-]\d{2}[./-]\d{2,4}(?:\s+\d{1,2}:\d{2})?", r"\d{4}-\d{2}-\d{2}", r"\d{1,2}:\d{2}"]
-    for p in patterns:
-        m = re.search(p, text)
-        if m:
-            return m.group(0)
+    text = text.replace(",", ".")
+    patterns = [r'\d+\.\d{2}', r'\d+\.\d{1}', r'\d+']
+    for pattern in patterns:
+        vals = re.findall(pattern, text)
+        if vals:
+            return max(vals, key=len)
     return ""
 
 
-def clean_code(text: str) -> str:
+def clean_barcode(text):
     if not text:
         return ""
-    m = re.search(r"[A-Za-z0-9_\-]{4,}", text)
-    return m.group(0) if m else ""
-
-
-def clean_barcode(text: str) -> str:
-    if not text:
+    vals = re.findall(r"\d{8,14}", text.replace(" ", ""))
+    if not vals:
         return ""
-    m = re.search(r"\b\d{8,14}\b", text)
-    return m.group(0) if m else ""
+    return max(vals, key=len)
 
 
-def clean_generic(text: str) -> str:
-    if not text:
-        return ""
-    return " ".join(str(text).split())
-
-
-def parse_qr_prices(text: str) -> List[str]:
+def parse_qr_prices(text):
     if not text:
         return []
     vals = re.findall(r"\d+[.,]\d{2}", text)
-    return [v.replace(",", ".") for v in vals][:4]
+    return [v.replace(",", ".") for v in vals[:4]]
 
 
-def ocr_image(reader: easyocr.Reader, img: np.ndarray) -> Tuple[str, float]:
-    if img is None or img.size == 0:
-        return "", 0.0
-    try:
-        results = reader.readtext(img)
-    except Exception:
-        return "", 0.0
-    if not results:
-        return "", 0.0
-    txt = [r[1] for r in results if r[2] > 0.2]
-    conf = [float(r[2]) for r in results]
-    return " ".join(txt), float(np.mean(conf)) if conf else 0.0
-
-
-def decode_qr(crop: np.ndarray, sr_model) -> str:
-    if crop is None or crop.size == 0:
-        return ""
-    if pyzbar_decode is None:
-        return ""
-    enhanced = enhance_crop(crop, sr_model)
-    try:
-        results = pyzbar_decode(enhanced)
-    except Exception:
-        return ""
-    out = []
-    for r in results:
-        try:
-            out.append(r.data.decode("utf-8", errors="ignore"))
-        except Exception:
-            continue
-    return " | ".join([x for x in out if x])
-
-
-def infer_color(crop: np.ndarray) -> str:
-    if crop is None or crop.size == 0:
-        return "нет"
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    h = float(np.mean(hsv[:, :, 0]))
-    s = float(np.mean(hsv[:, :, 1]))
-    v = float(np.mean(hsv[:, :, 2]))
-    if s < 25 and v > 170:
-        return "white"
-    if h < 10 or h > 170:
-        return "red"
-    if 15 <= h <= 40:
-        return "yellow"
-    if 40 < h <= 85:
-        return "green"
-    if 85 < h <= 135:
-        return "blue"
-    return "red"
-
-
-def iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
-    inter = iw * ih
-    if inter <= 0:
-        return 0.0
-    aa = max(1, (ax2 - ax1) * (ay2 - ay1))
-    ba = max(1, (bx2 - bx1) * (by2 - by1))
-    return inter / float(aa + ba - inter)
-
-
-def center(box: Tuple[int, int, int, int]) -> Tuple[float, float]:
-    x1, y1, x2, y2 = box
-    return (0.5 * (x1 + x2), 0.5 * (y1 + y2))
-
-
-def distance(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
-    ax, ay = center(a)
-    bx, by = center(b)
-    return float(np.hypot(ax - bx, ay - by))
-
-
-def expand_box(box: Tuple[int, int, int, int], pad: float, w: int, h: int) -> Tuple[int, int, int, int]:
+def expand_box(box, pad, w, h):
     x1, y1, x2, y2 = box
     bw = x2 - x1
     bh = y2 - y1
-    px = int(max(4, bw * pad))
-    py = int(max(4, bh * pad))
-    return max(0, x1 - px), max(0, y1 - py), min(w - 1, x2 + px), min(h - 1, y2 + py)
+    px = int(bw * pad)
+    py = int(bh * pad)
+    return (
+        max(0, x1 - px),
+        max(0, y1 - py),
+        min(w - 1, x2 + px),
+        min(h - 1, y2 + py)
+    )
 
 
-def get_model_names(model: YOLO) -> Dict[int, str]:
+def center(box):
+    x1, y1, x2, y2 = box
+    return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+
+def distance(box1, box2):
+    x1, y1 = center(box1)
+    x2, y2 = center(box2)
+    return np.hypot(x1 - x2, y1 - y2)
+
+
+def iou(box1, box2):
+    ax1, ay1, ax2, ay2 = box1
+    bx1, by1, bx2, by2 = box2
+    x1 = max(ax1, bx1)
+    y1 = max(ay1, by1)
+    x2 = min(ax2, bx2)
+    y2 = min(ay2, by2)
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (ax2 - ax1) * (ay2 - ay1)
+    area2 = (bx2 - bx1) * (by2 - by1)
+    union = area1 + area2 - inter
+    if union <= 0:
+        return 0
+    return inter / union
+
+
+def enhance_image(img):
+    if img is None or img.size == 0:
+        return None
+    h, w = img.shape[:2]
+    scale = min(2, max(1, int(600 / min(h, w))))  # FIX: уменьшил максимальный масштаб для скорости
+    if scale > 1:
+        img = cv2.resize(img, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+    if len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img
+    gray = cv2.medianBlur(gray, 3)
+    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+    kernel = np.ones((2, 2), np.uint8)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    return binary
+
+
+# ============================================================
+# OCR ФУНКЦИИ (ускоренная)
+# ============================================================
+
+def paddle_ocr_enhanced(img):
+    """Ускоренная OCR: только один вариант обработки"""
+    if img is None or img.size == 0 or ocr is None:
+        return "", 0.0
+
+    # FIX: только одна, самая эффективная предобработка
+    processed = enhance_image(img)
+    if processed is None:
+        processed = img
+
     try:
-        if hasattr(model, "model") and hasattr(model.model, "names"):
-            return dict(model.model.names)
-        if hasattr(model, "names"):
-            return dict(model.names)
-    except Exception:
+        # Конвертация в RGB для PaddleOCR
+        if len(processed.shape) == 2:
+            processed = cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB)
+        elif processed.shape[2] == 4:
+            processed = cv2.cvtColor(processed, cv2.COLOR_BGRA2RGB)
+        elif processed.shape[2] == 3 and processed.dtype == np.uint8:
+            if processed[0, 0, 0] > processed[0, 0, 2]:
+                processed = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB)
+
+        result = ocr.ocr(processed, cls=True)
+        if result and result[0]:
+            texts = []
+            scores = []
+            for line in result[0]:
+                if line and len(line) >= 2:
+                    texts.append(line[1][0])
+                    scores.append(line[1][1])
+            if texts:
+                combined = " ".join(texts)
+                avg_score = sum(scores) / len(scores)
+                return clean_text(combined), float(avg_score)
+    except Exception as e:
+        logger.debug(f"OCR error: {e}")
+    return "", 0.0
+
+
+# ============================================================
+# QR (ускоренный)
+# ============================================================
+
+def decode_qr(crop):
+    if pyzbar_decode is None:
+        return ""
+    # FIX: только два варианта: серый и увеличенный (без адаптивного порога для скорости)
+    if len(crop.shape) == 3:
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = crop
+    # сначала пробуем на оригинальном масштабе
+    try:
+        decoded = pyzbar_decode(gray)
+        if decoded:
+            vals = [d.data.decode("utf-8", errors="ignore") for d in decoded]
+            if vals:
+                return " | ".join(vals)
+    except:
         pass
-    return {i: n for i, n in enumerate(MODEL_CLASSES)}
-
-
-def detect_frame(model: YOLO, frame: np.ndarray, conf: float, imgsz: int, names_map: Dict[int, str]) -> List[Detection]:
-    out: List[Detection] = []
-    res = model.predict(source=frame, conf=conf, imgsz=imgsz, verbose=False)
-    if not res:
-        return out
-    r = res[0]
-    boxes = getattr(r, "boxes", None)
-    if boxes is None or len(boxes) == 0:
-        return out
-
+    # потом увеличиваем
+    big = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
     try:
-        cls_arr = boxes.cls.cpu().numpy()
-        xyxy = boxes.xyxy.cpu().numpy()
-        confs = boxes.conf.cpu().numpy()
-    except Exception:
-        cls_arr = np.array(boxes.cls)
-        xyxy = np.array(boxes.xyxy)
-        confs = np.array(boxes.conf)
+        decoded = pyzbar_decode(big)
+        if decoded:
+            vals = [d.data.decode("utf-8", errors="ignore") for d in decoded]
+            if vals:
+                return " | ".join(vals)
+    except:
+        pass
+    return ""
 
-    for cls_id, bb, c in zip(cls_arr, xyxy, confs):
-        cid = int(cls_id)
-        name = names_map.get(cid, f"class_{cid}")
-        if name not in MODEL_CLASSES:
-            continue
-        x1, y1, x2, y2 = [int(max(0, v)) for v in bb[:4]]
-        if x2 <= x1 or y2 <= y1:
-            continue
-        out.append(Detection(class_name=name, conf=float(c), bbox=(x1, y1, x2, y2)))
+
+# ============================================================
+# YOLO
+# ============================================================
+
+def get_model_names(model):
+    if hasattr(model, "names"):
+        return model.names
+    if hasattr(model.model, "names"):
+        return model.model.names
+    return {}
+
+
+def detect(model, frame, conf, imgsz):
+    names = get_model_names(model)
+    results = model.predict(source=frame, conf=conf, imgsz=imgsz, verbose=False)
+    out = []
+    if not results:
+        return out
+    boxes = results[0].boxes
+    if boxes is None:
+        return out
+    cls_arr = boxes.cls.cpu().numpy()
+    conf_arr = boxes.conf.cpu().numpy()
+    xyxy_arr = boxes.xyxy.cpu().numpy()
+    for cls_id, cf, bb in zip(cls_arr, conf_arr, xyxy_arr):
+        name = names.get(int(cls_id), str(int(cls_id)))
+        x1, y1, x2, y2 = map(int, bb[:4])
+        out.append(Detection(class_name=name, conf=float(cf), bbox=(x1, y1, x2, y2)))
     return out
 
 
-def update_track_field(track: TrackState, key: str, value: str, score: float):
-    if not value:
+# ============================================================
+# TRACKING (улучшенный)
+# ============================================================
+
+def update_votes(track, field_name, value, score):
+    if not value or value == "нет":
         return
-    old = track.fields.get(key)
-    if old is None or score > old[1]:
-        track.fields[key] = (value, score)
+    track.field_votes[field_name].append((value, score))
+    logger.debug(f"Track {track.track_id}: {field_name} = '{value}' (score: {score:.3f})")
 
 
-def detection_to_text(det: Detection, crop: np.ndarray, reader: easyocr.Reader, sr_model, sharpness: float) -> Tuple[str, float, bool]:
-    """Return (text, confidence, from_qr)
-    - from_qr==True means text was obtained strictly from QR decode (pyzbar)
-    - For class 'qr_code_barcode' we ONLY accept decoded QR (no OCR fallback)
-    - For other barcode/code classes we attempt decode then OCR
-    - Skip OCR for very blurry/small crops according to SHARPNESS_THRESHOLD and MIN_CROP_AREA_FOR_OCR
-    """
-    # QR class: strict decode only
-    if det.class_name == 'qr_code_barcode':
-        decoded = decode_qr(crop, sr_model)
-        if decoded:
-            return decoded, max(0.5, det.conf), True
-        logger.debug(f"QR decode empty for qr_code_barcode (conf={det.conf})")
-        return "", 0.0, False
-
-    # For barcode/code: try decode first
-    if det.class_name in {'barcode', 'code'}:
-        decoded = decode_qr(crop, sr_model)
-        if decoded:
-            return decoded, max(0.5, det.conf), True
-
-    # Decide whether to run OCR
-    area = crop.shape[0] * crop.shape[1]
-    if sharpness < SHARPNESS_THRESHOLD or area < MIN_CROP_AREA_FOR_OCR:
-        logger.debug(f"Skipping OCR for class={det.class_name} due to low sharpness={sharpness:.1f} or small area={area}")
-        return "", 0.0, False
-
-    txt, ocr_conf = ocr_image(reader, enhance_crop(crop, sr_model))
-    return txt, max(ocr_conf, det.conf * 0.5), False
+def get_best_vote(votes):
+    if not votes:
+        return "нет"
+    weighted = defaultdict(float)
+    for val, score in votes:
+        weighted[val] += score
+    return max(weighted.items(), key=lambda x: x[1])[0]
 
 
-def apply_cleaner(class_name: str, text: str) -> str:
-    if class_name in {"price_card", "price_default", "price_discount", "discount_amount"}:
-        return clean_price(text)
-    if class_name == "print_datetime":
-        return clean_date(text)
-    if class_name in {"barcode"}:
-        return clean_barcode(text) or clean_code(text)
-    if class_name in {"id_sku", "code", "qr_code_barcode"}:
-        return clean_code(text)
-    if class_name in {"product_name", "additional_info"}:
-        return clean_generic(text)
-    return clean_generic(text)
-
-
-def within(box: Tuple[int, int, int, int], region: Tuple[int, int, int, int]) -> bool:
-    bx, by = center(box)
-    x1, y1, x2, y2 = region
-    return x1 <= bx <= x2 and y1 <= by <= y2
-
-
-def match_tracks(
-    tracks: Dict[int, TrackState],
-    anchors: List[Detection],
-    frame_idx: int,
-    next_id: int,
-    max_age: int,
-) -> Tuple[Dict[int, TrackState], List[Tuple[int, Detection]], int]:
-    active = [t for t in tracks.values() if frame_idx - t.last_frame <= max_age]
+def match_tracks(tracks, detections, frame_idx, next_track_id, max_lost=10):
+    matched = []
     used_tracks = set()
-    matched: List[Tuple[int, Detection]] = []
-
-    for a in anchors:
-        best_tid = None
-        best_score = -1e9
-        for t in active:
-            if t.track_id in used_tracks:
+    for det in detections:
+        best_id = None
+        best_score = -1
+        for tid, track in tracks.items():
+            if tid in used_tracks:
                 continue
-            i = iou(t.last_bbox, a.bbox)
-            d = distance(t.last_bbox, a.bbox)
-            score = i * 2.5 - 0.002 * d
+            i = iou(track.last_bbox, det.bbox)
+            d = distance(track.last_bbox, det.bbox)
+            score = i - d * 0.001
             if score > best_score:
                 best_score = score
-                best_tid = t.track_id
+                best_id = tid
+        if best_id is not None and best_score > 0.1:  # FIX: повышен порог
+            tracks[best_id].last_bbox = det.bbox
+            tracks[best_id].last_frame = frame_idx
+            tracks[best_id].lost_counter = 0
+            matched.append((best_id, det))
+            used_tracks.add(best_id)
+        else:
+            tid = next_track_id
+            next_track_id += 1
+            tracks[tid] = TrackState(
+                track_id=tid,
+                first_frame=frame_idx,
+                first_bbox=det.bbox,
+                last_frame=frame_idx,
+                last_bbox=det.bbox
+            )
+            matched.append((tid, det))
+    # Увеличиваем lost_counter для неиспользованных треков
+    for tid, track in tracks.items():
+        if tid not in used_tracks:
+            track.lost_counter += 1
+    # Удаляем давно потерянные треки
+    to_del = [tid for tid, track in tracks.items() if track.lost_counter > max_lost]
+    for tid in to_del:
+        del tracks[tid]
+    return tracks, matched, next_track_id
 
-        if best_tid is not None:
-            t = tracks[best_tid]
-            if iou(t.last_bbox, a.bbox) >= 0.08 or distance(t.last_bbox, a.bbox) <= 220:
-                tracks[best_tid].last_bbox = a.bbox
-                tracks[best_tid].last_frame = frame_idx
-                matched.append((best_tid, a))
-                used_tracks.add(best_tid)
-                continue
 
-        tid = next_id
-        next_id += 1
-        tracks[tid] = TrackState(
-            track_id=tid,
-            first_frame=frame_idx,
-            first_bbox=a.bbox,
-            last_frame=frame_idx,
-            last_bbox=a.bbox,
-        )
-        matched.append((tid, a))
-        used_tracks.add(tid)
-
-    return tracks, matched, next_id
-
-
-def post_fill_row(row: Dict[str, str]):
-    if row["barcode"] == "нет":
-        val = clean_barcode(row["qr_code_barcode"])
-        if val:
-            row["barcode"] = val
-    if row["id_sku"] == "нет":
-        cand = re.search(r"\b\d{9,13}\b", row["code"]) if row["code"] != "нет" else None
-        if cand:
-            row["id_sku"] = cand.group(0)
-    if row["price_discount"] == "нет" and row["price_card"] != "нет":
-        row["price_discount"] = row["price_card"]
-
-    qr_text = row["qr_code_barcode"] if row["qr_code_barcode"] != "нет" else ""
-    qr_prices = parse_qr_prices(qr_text)
-    qr_targets = ["price1_qr", "price2_qr", "price3_qr", "price4_qr"]
-    for i, p in enumerate(qr_prices):
-        if i < len(qr_targets) and row[qr_targets[i]] == "нет":
-            row[qr_targets[i]] = p
-
-    if row["action_price_qr"] == "нет" and row["price_card"] != "нет":
-        row["action_price_qr"] = row["price_card"]
-
+# ============================================================
+# MAIN (оптимизированный)
+# ============================================================
 
 def process_video(
-    video_path: pathlib.Path,
-    weights_path: pathlib.Path,
-    out_csv: pathlib.Path,
-    video_label: str,
-    frame_stride: int,
-    conf: float,
-    imgsz: int,
-    rotate_ccw90: bool,
-    max_age: int,
-    examples_dir: Optional[pathlib.Path],
-    examples_count: int,
+        video_path,
+        tag_model_path,
+        field_model_path,
+        out_csv,
+        conf,
+        imgsz,
+        frame_stride,
+        field_process_interval=5,      # FIX: обрабатывать поля (кроме QR) каждые N кадров
+        qr_process_interval=1,         # FIX: QR обрабатываем каждый кадр
+        max_lost_frames=15,            # FIX: через сколько кадров удалить трек
 ):
-    model = YOLO(str(weights_path))
-    names_map = get_model_names(model)
-    logger.info("Weights: %s", weights_path)
+    start_time = datetime.now()
+    logger.info(f"=== НАЧАЛО ОБРАБОТКИ ВИДЕО ===")
+    logger.info(f"Видео файл: {video_path}")
+    logger.info(f"Модель ценников: {tag_model_path}")
+    logger.info(f"Модель полей: {field_model_path}")
 
-    reader = easyocr.Reader(["ru", "en"], gpu=False)
-    sr_model = load_sr_model(resolve_project_root())
+    logger.info("Загрузка моделей YOLO...")
+    tag_model = YOLO(str(tag_model_path))
+    field_model = YOLO(str(field_model_path))
+    logger.info("Модели YOLO загружены")
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    logger.info("Video opened: fps=%.3f frames=%d", fps, total)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    logger.info(f"Видео: {total} кадров, {fps:.2f} FPS")
 
-    tracks: Dict[int, TrackState] = {}
-    next_id = 1
-
+    tracks = {}
+    next_track_id = 1
     frame_idx = 0
-    last_logged_pct = -1
+    processed_frames = 0
+    detected_tags = 0
+
+    logger.info("Начинаю обработку кадров...")
+
     while True:
         ok, frame = cap.read()
         if not ok:
             break
 
-        if rotate_ccw90:
-            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
         if frame_idx % frame_stride != 0:
             frame_idx += 1
             continue
 
-        dets = detect_frame(model, frame, conf=conf, imgsz=imgsz, names_map=names_map)
-        if not dets:
-            frame_idx += 1
-            continue
+        processed_frames += 1
 
-        anchors = [d for d in dets if d.class_name in ANCHOR_CLASSES]
-        if not anchors:
-            frame_idx += 1
-            continue
+        # Детекция ценников
+        tag_dets = detect(tag_model, frame, conf=0.15, imgsz=imgsz)
+        if tag_dets:
+            detected_tags += len(tag_dets)
+            logger.debug(f"Кадр {frame_idx}: найдено {len(tag_dets)} ценников")
 
-        tracks, matched, next_id = match_tracks(tracks, anchors, frame_idx, next_id, max_age=max_age)
+            tracks, matched, next_track_id = match_tracks(
+                tracks, tag_dets, frame_idx, next_track_id, max_lost_frames
+            )
 
-        h, w = frame.shape[:2]
+            # Обработка каждого трека
+            for track_id, det in matched:
+                track = tracks[track_id]
 
-        for tid, anchor in matched:
-            t = tracks[tid]
-            x1, y1, x2, y2 = anchor.bbox
-            x1c, y1c, x2c, y2c = max(0, x1), max(0, y1), min(w - 1, x2), min(h - 1, y2)
-            acrop = frame[y1c:y2c, x1c:x2c]
-
-            if t.color == "нет":
-                t.color = infer_color(acrop)
-
-            sharp = 0.0
-            if acrop is not None and acrop.size > 0:
-                gray = cv2.cvtColor(acrop, cv2.COLOR_BGR2GRAY)
-                sharp = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-            obs_score = float(anchor.conf) + 0.0004 * sharp
-
-            if obs_score > t.best_score:
-                t.best_score = obs_score
-                t.best_frame_idx = frame_idx
-                t.best_bbox = anchor.bbox
-                t.best_frame_img = frame.copy()
-
-            region = expand_box(anchor.bbox, pad=0.9, w=w, h=h)
-            related = [d for d in dets if within(d.bbox, region)]
-
-            for d in related:
-                dx1, dy1, dx2, dy2 = d.bbox
-                dx1, dy1 = max(0, dx1), max(0, dy1)
-                dx2, dy2 = min(w - 1, dx2), min(h - 1, dy2)
-                crop = frame[dy1:dy2, dx1:dx2]
-                if crop is None or crop.size == 0:
+                # Расширяем область ценника
+                x1, y1, x2, y2 = expand_box(det.bbox, pad=0.1, w=frame.shape[1], h=frame.shape[0])
+                tag_crop = frame[y1:y2, x1:x2]
+                if tag_crop.size == 0:
                     continue
-                raw, txt_conf, from_qr = detection_to_text(d, crop, reader=reader, sr_model=sr_model, sharpness=sharp)
-                cleaned = apply_cleaner(d.class_name, raw)
-                score = float(d.conf) * max(0.2, txt_conf)
 
-                # Handle qr_code_barcode strictly from decoded QR only
-                if d.class_name == "qr_code_barcode":
-                    if from_qr and raw:
-                        update_track_field(t, "qr_code_barcode", raw, score)
+                # Проверка четкости (снизил порог)
+                sharpness = laplacian_score(tag_crop)
+                if sharpness < 15:
+                    logger.debug(f"Ценник {track_id}: низкая четкость ({sharpness:.1f})")
+                    continue
+
+                score = det.conf + sharpness * 0.0005
+                if score > track.best_score:
+                    track.best_score = score
+
+                # Увеличиваем для детекции полей (умеренно)
+                scale = min(2, max(1, int(600 / min(tag_crop.shape[:2]))))
+                if scale > 1:
+                    tag_crop = cv2.resize(tag_crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+                # Детекция полей на этом кадре (один раз на трек)
+                field_dets = detect(field_model, tag_crop, conf=conf, imgsz=640)
+
+                for fd in field_dets:
+                    field_name = fd.class_name
+                    if field_name not in FIELD_CLASSES:
+                        continue
+
+                    # FIX: Определяем, нужно ли обрабатывать это поле на текущем кадре
+                    last_proc = track.last_processed_frame.get(field_name, -999)
+                    if field_name in QR_FIELDS:
+                        interval = qr_process_interval
+                    elif field_name in PRICE_FIELDS:
+                        interval = max(1, field_process_interval // 2)  # цены чуть чаще
                     else:
-                        logger.debug(f"qr_code_barcode not decoded in frame {frame_idx} track={t.track_id}")
+                        interval = field_process_interval
 
-                elif d.class_name == "barcode":
-                    # barcode: accept decoded payload first, else attempt cleaned OCR barcode
-                    if from_qr and raw:
-                        update_track_field(t, "barcode", raw, score)
-                    else:
-                        val = clean_barcode(cleaned) or clean_barcode(raw) or cleaned
-                        if val:
-                            update_track_field(t, "barcode", val, score)
+                    if frame_idx - last_proc < interval:
+                        continue  # пропускаем, ещё не время
 
-                else:
-                    # other classes: use cleaned OCR if available
-                    if raw and not from_qr:
-                        update_track_field(t, d.class_name, cleaned, score)
+                    # Обновляем время обработки
+                    track.last_processed_frame[field_name] = frame_idx
 
-                # Keep extra fields from QR payloads only if from actual QR decode
-                if from_qr and raw:
-                    prices = parse_qr_prices(raw)
-                    for i, p in enumerate(prices[:4], start=1):
-                        update_track_field(t, f"price{i}_qr", p, score * (0.98 - 0.05 * i))
+                    fx1, fy1, fx2, fy2 = fd.bbox
+                    crop = tag_crop[fy1:fy2, fx1:fx2]
+                    if crop.size == 0:
+                        continue
 
-        # Progress logging
-        if total and total > 0:
-            pct = int(frame_idx / float(total) * 100)
-            if pct - last_logged_pct >= 2:
-                logger.info(f"Processing video: {pct}% ({frame_idx}/{total} frames)")
-                last_logged_pct = pct
+                    # QR
+                    if field_name == "qr_code_barcode":
+                        qr_text = decode_qr(crop)
+                        if qr_text:
+                            logger.info(f"Track {track_id}: QR обновлён: {qr_text[:50]}")
+                            update_votes(track, "qr_code_barcode", qr_text, 3.0)
+                            qr_prices = parse_qr_prices(qr_text)
+                            for i, p in enumerate(qr_prices):
+                                if p:
+                                    update_votes(track, f"price{i+1}_qr", p, 2.0)
+                        continue
+
+                    # Штрихкод
+                    if field_name == "barcode":
+                        barcode = decode_qr(crop)
+                        if not barcode:
+                            txt, score_ocr = paddle_ocr_enhanced(crop)
+                            barcode = clean_barcode(txt)
+                        if barcode:
+                            logger.info(f"Track {track_id}: штрихкод {barcode}")
+                            update_votes(track, "barcode", barcode, 2.5)
+                        continue
+
+                    # Текстовые поля (OCR)
+                    txt, ocr_conf = paddle_ocr_enhanced(crop)
+                    if txt and ocr_conf > 0.2:
+                        if field_name in PRICE_FIELDS:
+                            txt = clean_price(txt)
+                            if txt:
+                                logger.info(f"Track {track_id}: {field_name} = {txt} (conf {ocr_conf:.2f})")
+                        else:
+                            txt = clean_text(txt)
+                            if txt:
+                                logger.info(f"Track {track_id}: {field_name} = '{txt}'")
+                        if txt:
+                            boost = 2.0 if field_name in PRICE_FIELDS else 1.0
+                            update_votes(track, field_name, txt, ocr_conf * boost)
 
         frame_idx += 1
 
+        # Логирование прогресса
+        if frame_idx % 200 == 0:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            progress = (frame_idx / total) * 100 if total > 0 else 0
+            logger.info(f"Прогресс: {progress:.1f}% ({frame_idx}/{total}) | Треков: {len(tracks)} | Время: {elapsed:.1f}с")
+
     cap.release()
 
-    rows: List[Dict[str, str]] = []
-    for tid in sorted(tracks.keys(), key=lambda k: tracks[k].first_frame):
-        t = tracks[tid]
-        row = {k: "нет" for k in EXPECTED_COLUMNS}
-        row["filename"] = video_label
+    elapsed_total = (datetime.now() - start_time).total_seconds()
+    logger.info(f"=== ОБРАБОТКА ЗАВЕРШЕНА ===")
+    logger.info(f"Обработано кадров: {processed_frames}")
+    logger.info(f"Найдено ценников: {detected_tags}")
+    logger.info(f"Отслеживаемых объектов: {len(tracks)}")
+    logger.info(f"Общее время: {elapsed_total:.1f} секунд")
 
-        x1, y1, x2, y2 = t.first_bbox
-        row["frame_timestamp"] = str(t.first_frame)
-        row["x_min"] = str(x1)
-        row["y_min"] = str(y1)
-        row["x_max"] = str(x2)
-        row["y_max"] = str(y2)
-        row["color"] = t.color if t.color else "нет"
+    # Формирование CSV
+    logger.info("Формирование результатов...")
+    rows = []
+    for tid in sorted(tracks.keys()):
+        tr = tracks[tid]
+        row = {col: "нет" for col in EXPECTED_COLUMNS}
+        row["filename"] = video_path.name if hasattr(video_path, 'name') else str(video_path)
+        x1, y1, x2, y2 = tr.first_bbox
+        row["x_min"] = x1
+        row["y_min"] = y1
+        row["x_max"] = x2
+        row["y_max"] = y2
+        row["frame_timestamp"] = tr.first_frame
 
-        for k, (v, _) in t.fields.items():
-            if k in row and v:
-                row[k] = v
+        for field_name, votes in tr.field_votes.items():
+            if votes:
+                best = get_best_vote(votes)
+                row[field_name] = best
+                logger.debug(f"Track {tid}: {field_name} = '{best}'")
 
-        post_fill_row(row)
+        if row["price_discount"] == "нет" and row["price_card"] != "нет":
+            row["price_discount"] = row["price_card"]
         rows.append(row)
 
+    out_csv = pathlib.Path(out_csv)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(rows, columns=EXPECTED_COLUMNS).to_csv(out_csv, index=False, encoding="utf-8-sig")
-    logger.info("Saved CSV: %s (%d rows)", out_csv, len(rows))
+    df = pd.DataFrame(rows, columns=EXPECTED_COLUMNS)
+    df.to_csv(out_csv, index=False, encoding="utf-8-sig")
 
-    if examples_dir is not None and examples_count > 0:
-        examples_dir.mkdir(parents=True, exist_ok=True)
-        ranked = sorted(tracks.values(), key=lambda t: t.best_score, reverse=True)
-        saved = 0
-        for t in ranked:
-            if t.best_frame_img is None or t.best_bbox is None:
-                continue
-            img = t.best_frame_img.copy()
-            x1, y1, x2, y2 = t.best_bbox
-            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(
-                img,
-                f"track={t.track_id} frame={t.best_frame_idx}",
-                (max(0, x1), max(16, y1 - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (0, 255, 0),
-                2,
-            )
-            out_img = examples_dir / f"example_track_{t.track_id:03d}.jpg"
-            cv2.imwrite(str(out_img), img)
-            saved += 1
-            if saved >= examples_count:
-                break
-        logger.info("Saved examples: %d -> %s", saved, examples_dir)
+    non_empty_stats = {col: (df[col] != "нет").sum() for col in EXPECTED_COLUMNS if (df[col] != "нет").sum() > 0}
+    logger.info("=== СТАТИСТИКА РАСПОЗНАВАНИЯ ===")
+    for col, count in sorted(non_empty_stats.items(), key=lambda x: x[1], reverse=True):
+        logger.info(f"  {col}: {count} ценников ({count/len(rows)*100:.1f}%)")
+    logger.info(f"Результаты сохранены: {out_csv}")
+    return df
 
+
+# ============================================================
+# ARGS
+# ============================================================
 
 def parse_args():
     root = resolve_project_root()
-    default_video = root / "data" / "Данные" / "25_12-20" / "25_12-20.mp4"
-    default_weights = root / "weight" / "best.pt"
-    default_csv = root / "runs" / "visualizations" / "25_12-20_tracking.csv"
-    default_examples = root / "runs" / "visualizations" / "tracking_examples"
-
-    p = argparse.ArgumentParser(description="Video -> tracked price tags -> CSV")
-    p.add_argument("--video", type=pathlib.Path, default=default_video)
-    p.add_argument("--weights", type=pathlib.Path, default=default_weights)
-    p.add_argument("--out-csv", type=pathlib.Path, default=default_csv)
-    p.add_argument("--video-label", type=str, default="25_12-20/25_12-20.mp4")
-    p.add_argument("--frame-stride", type=int, default=5)
-    p.add_argument("--conf", type=float, default=0.25)
-    p.add_argument("--imgsz", type=int, default=1280)
-    p.add_argument("--max-age", type=int, default=45)
-    p.add_argument(
-        "--no-rotate",
-        action="store_true",
-        help="Do not rotate frames. By default frames are rotated 90 CCW.",
-    )
-    p.add_argument("--examples-dir", type=pathlib.Path, default=default_examples)
-    p.add_argument("--examples-count", type=int, default=2)
-    return p.parse_args()
+    parser = argparse.ArgumentParser(description="Распознавание ценников на видео")
+    parser.add_argument("--video", type=pathlib.Path, required=True)
+    parser.add_argument("--tag-model", type=pathlib.Path, default=root / "weight" / "best-price-tag.pt")
+    parser.add_argument("--field-model", type=pathlib.Path, default=root / "weight" / "best.pt")
+    parser.add_argument("--out-csv", type=pathlib.Path, default=root / "runs" / "result.csv")
+    parser.add_argument("--conf", type=float, default=0.25, help="Порог детекции полей")
+    parser.add_argument("--imgsz", type=int, default=640, help="Размер для YOLO")
+    parser.add_argument("--frame-stride", type=int, default=2, help="Пропускать кадры")
+    parser.add_argument("--field-interval", type=int, default=5, help="Обрабатывать поля раз в N кадров")
+    parser.add_argument("--qr-interval", type=int, default=1, help="QR обрабатывать каждый N кадров")
+    return parser.parse_args()
 
 
 def main():
     args = parse_args()
-
-    if not args.video.exists():
-        raise FileNotFoundError(f"Video not found: {args.video}")
-    if not args.weights.exists():
-        raise FileNotFoundError(f"Weights not found: {args.weights}")
-
     process_video(
         video_path=args.video,
-        weights_path=args.weights,
+        tag_model_path=args.tag_model,
+        field_model_path=args.field_model,
         out_csv=args.out_csv,
-        video_label=args.video_label,
-        frame_stride=max(1, args.frame_stride),
         conf=args.conf,
         imgsz=args.imgsz,
-        rotate_ccw90=not bool(args.no_rotate),
-        max_age=max(1, args.max_age),
-        examples_dir=args.examples_dir,
-        examples_count=max(0, args.examples_count),
+        frame_stride=args.frame_stride,
+        field_process_interval=args.field_interval,
+        qr_process_interval=args.qr_interval,
     )
 
 
 if __name__ == "__main__":
     main()
-
-
-
