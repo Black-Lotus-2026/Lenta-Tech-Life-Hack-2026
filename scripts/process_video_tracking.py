@@ -21,6 +21,35 @@ try:
 except Exception:
     pyzbar_decode = None
 
+def rotate_image(img, deg):
+    if deg == 90:
+        return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    elif deg == 180:
+        return cv2.rotate(img, cv2.ROTATE_180)
+    elif deg == 270:
+        return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return img
+
+def invert_rotate_bbox(bbox, rot_deg, crop_w, crop_h):
+    x1, y1, x2, y2 = bbox
+    if rot_deg == 90:
+        new_x1 = y1
+        new_y1 = crop_h - x2
+        new_x2 = y2
+        new_y2 = crop_h - x1
+    elif rot_deg == 180:
+        new_x1 = crop_w - x2
+        new_y1 = crop_h - y2
+        new_x2 = crop_w - x1
+        new_y2 = crop_h - y1
+    elif rot_deg == 270:
+        new_x1 = crop_h - y2
+        new_y1 = x1
+        new_x2 = crop_h - y1
+        new_y2 = x2
+    else:
+        return (x1, y1, x2, y2)
+    return (min(new_x1, new_x2), min(new_y1, new_y2), max(new_x1, new_x2), max(new_y1, new_y2))
 
 # ============================================================
 # LOGGING (с временем)
@@ -447,9 +476,10 @@ def process_video(
         conf,
         imgsz,
         frame_stride,
-        field_process_interval=5,      # FIX: обрабатывать поля (кроме QR) каждые N кадров
-        qr_process_interval=1,         # FIX: QR обрабатываем каждый кадр
-        max_lost_frames=15,            # FIX: через сколько кадров удалить трек
+        field_process_interval=5,
+        qr_process_interval=1,
+        max_lost_frames=15,
+        rotate_field=270,
 ):
     start_time = datetime.now()
     logger.info(f"=== НАЧАЛО ОБРАБОТКИ ВИДЕО ===")
@@ -525,7 +555,25 @@ def process_video(
                     tag_crop = cv2.resize(tag_crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
                 # Детекция полей на этом кадре (один раз на трек)
-                field_dets = detect(field_model, tag_crop, conf=conf, imgsz=640)
+                if rotate_field != 0:
+                    tag_crop_rot = rotate_image(tag_crop, rotate_field)
+                else:
+                    tag_crop_rot = tag_crop
+
+                field_dets = detect(field_model, tag_crop_rot, conf=conf, imgsz=640)
+
+                for fd in field_dets:
+                    field_name = fd.class_name
+                    if field_name not in FIELD_CLASSES:
+                        continue
+
+                    # Преобразуем координаты поля из повёрнутого кропа в исходный кроп
+                    if rotate_field != 0:
+                        fx1, fy1, fx2, fy2 = fd.bbox
+                        orig_w = tag_crop.shape[1]
+                        orig_h = tag_crop.shape[0]
+                        fx1, fy1, fx2, fy2 = invert_rotate_bbox((fx1, fy1, fx2, fy2), rotate_field, orig_w, orig_h)
+                        fd.bbox = (fx1, fy1, fx2, fy2)  # теперь координаты в tag_crop
 
                 for fd in field_dets:
                     field_name = fd.class_name
@@ -660,6 +708,8 @@ def parse_args():
     parser.add_argument("--frame-stride", type=int, default=2, help="Пропускать кадры")
     parser.add_argument("--field-interval", type=int, default=5, help="Обрабатывать поля раз в N кадров")
     parser.add_argument("--qr-interval", type=int, default=1, help="QR обрабатывать каждый N кадров")
+    parser.add_argument("--rotate-field", type=int, default=270, choices=[0, 90, 180, 270],
+                        help="Поворот вырезанного ценника перед field моделью (0,90,180,270)")
     return parser.parse_args()
 
 
