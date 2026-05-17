@@ -21,7 +21,9 @@ try:
 except Exception:
     pyzbar_decode = None
 
+
 def rotate_image(img, deg):
+    """Поворот изображения"""
     if deg == 90:
         return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
     elif deg == 180:
@@ -30,26 +32,6 @@ def rotate_image(img, deg):
         return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
     return img
 
-def invert_rotate_bbox(bbox, rot_deg, crop_w, crop_h):
-    x1, y1, x2, y2 = bbox
-    if rot_deg == 90:
-        new_x1 = y1
-        new_y1 = crop_h - x2
-        new_x2 = y2
-        new_y2 = crop_h - x1
-    elif rot_deg == 180:
-        new_x1 = crop_w - x2
-        new_y1 = crop_h - y2
-        new_x2 = crop_w - x1
-        new_y2 = crop_h - y1
-    elif rot_deg == 270:
-        new_x1 = crop_h - y2
-        new_y1 = x1
-        new_x2 = crop_h - y1
-        new_y2 = x2
-    else:
-        return (x1, y1, x2, y2)
-    return (min(new_x1, new_x2), min(new_y1, new_y2), max(new_x1, new_x2), max(new_y1, new_y2))
 
 # ============================================================
 # LOGGING (с временем)
@@ -125,11 +107,7 @@ FIELD_CLASSES = {
     "qr_code_barcode",
 }
 
-# FIX: Поля, которые обрабатываются редко (не каждый кадр)
-RARE_FIELDS = {"product_name", "additional_info", "code", "discount_amount", "id_sku", "print_datetime"}
-# FIX: Поля цен - обрабатываем чаще, но не каждый кадр
 PRICE_FIELDS = {"price_card", "price_default", "price_discount"}
-# FIX: QR и штрихкод - каждый кадр
 QR_FIELDS = {"qr_code_barcode", "barcode"}
 
 
@@ -155,9 +133,7 @@ class TrackState:
     field_votes: Dict[str, List[Tuple[str, float]]] = field(
         default_factory=lambda: defaultdict(list)
     )
-    # FIX: последний кадр, когда обрабатывали каждое поле
     last_processed_frame: Dict[str, int] = field(default_factory=dict)
-    # FIX: счётчик пропущенных кадров (для удаления старых треков)
     lost_counter: int = 0
 
 
@@ -277,62 +253,89 @@ def iou(box1, box2):
 
 
 def enhance_image(img):
+    """Улучшение изображения для OCR"""
     if img is None or img.size == 0:
         return None
     h, w = img.shape[:2]
-    scale = min(2, max(1, int(600 / min(h, w))))  # FIX: уменьшил максимальный масштаб для скорости
+
+    # Увеличиваем для лучшего распознавания (минимум 100 пикселей)
+    target_size = 400
+    scale = max(1, target_size / min(h, w))
     if scale > 1:
-        img = cv2.resize(img, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+
     if len(img.shape) == 3:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     else:
         gray = img
-    gray = cv2.medianBlur(gray, 3)
+
+    # Несколько вариантов обработки
+    enhanced = []
+
+    # 1. Оригинал
+    enhanced.append(gray)
+
+    # 2. Адаптивная бинаризация
     binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-    kernel = np.ones((2, 2), np.uint8)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-    return binary
+    enhanced.append(binary)
+
+    # 3. OTSU
+    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    enhanced.append(otsu)
+
+    # 4. Инвертированная OTSU (для светлого текста на тёмном фоне)
+    enhanced.append(cv2.bitwise_not(otsu))
+
+    return enhanced
 
 
 # ============================================================
-# OCR ФУНКЦИИ (ускоренная)
+# OCR ФУНКЦИИ
 # ============================================================
 
 def paddle_ocr_enhanced(img):
-    """Ускоренная OCR: только один вариант обработки"""
+    """Расширенное OCR с несколькими вариантами предобработки"""
     if img is None or img.size == 0 or ocr is None:
         return "", 0.0
 
-    # FIX: только одна, самая эффективная предобработка
-    processed = enhance_image(img)
-    if processed is None:
-        processed = img
+    results = []
 
-    try:
-        # Конвертация в RGB для PaddleOCR
-        if len(processed.shape) == 2:
-            processed = cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB)
-        elif processed.shape[2] == 4:
-            processed = cv2.cvtColor(processed, cv2.COLOR_BGRA2RGB)
-        elif processed.shape[2] == 3 and processed.dtype == np.uint8:
-            if processed[0, 0, 0] > processed[0, 0, 2]:
-                processed = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB)
+    # Получаем несколько вариантов обработки
+    processed_versions = enhance_image(img)
 
-        result = ocr.ocr(processed, cls=True)
-        if result and result[0]:
-            texts = []
-            scores = []
-            for line in result[0]:
-                if line and len(line) >= 2:
-                    texts.append(line[1][0])
-                    scores.append(line[1][1])
-            if texts:
-                combined = " ".join(texts)
-                avg_score = sum(scores) / len(scores)
-                return clean_text(combined), float(avg_score)
-    except Exception as e:
-        logger.debug(f"OCR error: {e}")
+    if processed_versions is None:
+        return "", 0.0
+
+    for processed in processed_versions:
+        try:
+            # Конвертация в RGB для PaddleOCR
+            if len(processed.shape) == 2:
+                processed_rgb = cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB)
+            elif processed.shape[2] == 4:
+                processed_rgb = cv2.cvtColor(processed, cv2.COLOR_BGRA2RGB)
+            elif processed.shape[2] == 3:
+                processed_rgb = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB)
+            else:
+                processed_rgb = processed
+
+            result = ocr.ocr(processed_rgb, cls=True)
+            if result and result[0]:
+                texts = []
+                scores = []
+                for line in result[0]:
+                    if line and len(line) >= 2:
+                        texts.append(line[1][0])
+                        scores.append(line[1][1])
+                if texts:
+                    combined = " ".join(texts)
+                    avg_score = sum(scores) / len(scores)
+                    results.append((clean_text(combined), float(avg_score)))
+        except Exception as e:
+            logger.debug(f"OCR error: {e}")
+
+    # Возвращаем лучший результат
+    if results:
+        return max(results, key=lambda x: x[1])
     return "", 0.0
 
 
@@ -341,32 +344,49 @@ def paddle_ocr_enhanced(img):
 # ============================================================
 
 def decode_qr(crop):
+    """Декодирование QR и штрихкодов"""
     if pyzbar_decode is None:
         return ""
-    # FIX: только два варианта: серый и увеличенный (без адаптивного порога для скорости)
+
+    results = []
+
+    # Конвертируем в серый
     if len(crop.shape) == 3:
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     else:
         gray = crop
-    # сначала пробуем на оригинальном масштабе
-    try:
-        decoded = pyzbar_decode(gray)
-        if decoded:
-            vals = [d.data.decode("utf-8", errors="ignore") for d in decoded]
-            if vals:
-                return " | ".join(vals)
-    except:
-        pass
-    # потом увеличиваем
-    big = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-    try:
-        decoded = pyzbar_decode(big)
-        if decoded:
-            vals = [d.data.decode("utf-8", errors="ignore") for d in decoded]
-            if vals:
-                return " | ".join(vals)
-    except:
-        pass
+
+    # Увеличиваем если слишком маленький
+    h, w = gray.shape[:2]
+    if min(h, w) < 100:
+        scale = 200 / min(h, w)
+        gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+
+    # Варианты обработки
+    variants = [
+        gray,  # оригинал
+        cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC),  # увеличенный
+    ]
+
+    # Бинаризованные варианты
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    variants.append(binary)
+    variants.append(cv2.bitwise_not(binary))  # инвертированный
+
+    for variant in variants:
+        try:
+            decoded = pyzbar_decode(variant)
+            if decoded:
+                for d in decoded:
+                    val = d.data.decode("utf-8", errors="ignore")
+                    if val and val not in results:
+                        results.append(val)
+                        logger.info(f"QR/ШК декодирован: {val[:50]}")
+        except Exception as e:
+            logger.debug(f"QR error: {e}")
+
+    if results:
+        return " | ".join(results)
     return ""
 
 
@@ -409,7 +429,7 @@ def update_votes(track, field_name, value, score):
     if not value or value == "нет":
         return
     track.field_votes[field_name].append((value, score))
-    logger.debug(f"Track {track.track_id}: {field_name} = '{value}' (score: {score:.3f})")
+    logger.info(f"Track {track.track_id}: {field_name} = '{value}' (score: {score:.3f})")
 
 
 def get_best_vote(votes):
@@ -422,21 +442,30 @@ def get_best_vote(votes):
 
 
 def match_tracks(tracks, detections, frame_idx, next_track_id, max_lost=10):
+    """
+    Улучшенный трекинг с учётом размера bounding box
+    """
     matched = []
     used_tracks = set()
+
     for det in detections:
         best_id = None
         best_score = -1
+
         for tid, track in tracks.items():
             if tid in used_tracks:
                 continue
+
             i = iou(track.last_bbox, det.bbox)
             d = distance(track.last_bbox, det.bbox)
-            score = i - d * 0.001
+
+            score = i - d * 0.0001
+
             if score > best_score:
                 best_score = score
                 best_id = tid
-        if best_id is not None and best_score > 0.1:  # FIX: повышен порог
+
+        if best_id is not None and best_score > 0.05:
             tracks[best_id].last_bbox = det.bbox
             tracks[best_id].last_frame = frame_idx
             tracks[best_id].lost_counter = 0
@@ -453,14 +482,15 @@ def match_tracks(tracks, detections, frame_idx, next_track_id, max_lost=10):
                 last_bbox=det.bbox
             )
             matched.append((tid, det))
-    # Увеличиваем lost_counter для неиспользованных треков
+
     for tid, track in tracks.items():
         if tid not in used_tracks:
             track.lost_counter += 1
-    # Удаляем давно потерянные треки
+
     to_del = [tid for tid, track in tracks.items() if track.lost_counter > max_lost]
     for tid in to_del:
         del tracks[tid]
+
     return tracks, matched, next_track_id
 
 
@@ -476,16 +506,22 @@ def process_video(
         conf,
         imgsz,
         frame_stride,
-        field_process_interval=5,
+        field_process_interval=2,
         qr_process_interval=1,
-        max_lost_frames=15,
-        rotate_field=270,
+        max_lost_frames=20,
+        tag_rotation=90,
+        debug_dir=None,  # Директория для сохранения отладочных изображений
 ):
     start_time = datetime.now()
     logger.info(f"=== НАЧАЛО ОБРАБОТКИ ВИДЕО ===")
     logger.info(f"Видео файл: {video_path}")
-    logger.info(f"Модель ценников: {tag_model_path}")
-    logger.info(f"Модель полей: {field_model_path}")
+    logger.info(f"Поворот ценника для field-модели: {tag_rotation} градусов")
+
+    # Создаём директорию для отладки
+    if debug_dir:
+        debug_dir = pathlib.Path(debug_dir)
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Отладочные изображения будут сохранены в: {debug_dir}")
 
     logger.info("Загрузка моделей YOLO...")
     tag_model = YOLO(str(tag_model_path))
@@ -505,6 +541,7 @@ def process_video(
     frame_idx = 0
     processed_frames = 0
     detected_tags = 0
+    debug_frame_count = 0  # Счётчик для отладки
 
     logger.info("Начинаю обработку кадров...")
 
@@ -519,132 +556,163 @@ def process_video(
 
         processed_frames += 1
 
-        # Детекция ценников
-        tag_dets = detect(tag_model, frame, conf=0.15, imgsz=imgsz)
+        # Детекция ценников на оригинальном видео
+        tag_dets = detect(tag_model, frame, conf=0.1, imgsz=imgsz)
+
         if tag_dets:
             detected_tags += len(tag_dets)
-            logger.debug(f"Кадр {frame_idx}: найдено {len(tag_dets)} ценников")
+
+            # Сохраняем первый кадр с ценниками для отладки
+            if debug_dir and debug_frame_count == 0:
+                debug_frame = frame.copy()
+                for det in tag_dets:
+                    x1, y1, x2, y2 = det.bbox
+                    cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(debug_frame, f"{det.class_name} {det.conf:.2f}",
+                                (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                cv2.imwrite(str(debug_dir / f"frame_{frame_idx}_tags.jpg"), debug_frame)
+                logger.info(f"Сохранён отладочный кадр с ценниками: frame_{frame_idx}_tags.jpg")
+
+            if frame_idx % 50 == 0:
+                logger.info(f"Кадр {frame_idx}: найдено {len(tag_dets)} ценников")
 
             tracks, matched, next_track_id = match_tracks(
                 tracks, tag_dets, frame_idx, next_track_id, max_lost_frames
             )
 
-            # Обработка каждого трека
             for track_id, det in matched:
                 track = tracks[track_id]
 
-                # Расширяем область ценника
-                x1, y1, x2, y2 = expand_box(det.bbox, pad=0.1, w=frame.shape[1], h=frame.shape[0])
+                x1, y1, x2, y2 = expand_box(det.bbox, pad=0.15, w=frame.shape[1], h=frame.shape[0])
                 tag_crop = frame[y1:y2, x1:x2]
+
                 if tag_crop.size == 0:
                     continue
 
-                # Проверка четкости (снизил порог)
                 sharpness = laplacian_score(tag_crop)
-                if sharpness < 15:
-                    logger.debug(f"Ценник {track_id}: низкая четкость ({sharpness:.1f})")
+                if sharpness < 5:
                     continue
 
-                score = det.conf + sharpness * 0.0005
+                score = det.conf + sharpness * 0.001
                 if score > track.best_score:
                     track.best_score = score
 
-                # Увеличиваем для детекции полей (умеренно)
-                scale = min(2, max(1, int(600 / min(tag_crop.shape[:2]))))
-                if scale > 1:
-                    tag_crop = cv2.resize(tag_crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+                # Сохраняем кроп ценника для отладки (только первый раз)
+                if debug_dir and debug_frame_count == 0 and track_id <= 3:
+                    cv2.imwrite(str(debug_dir / f"track_{track_id}_tag_crop_original.jpg"), tag_crop)
 
-                # Детекция полей на этом кадре (один раз на трек)
-                if rotate_field != 0:
-                    tag_crop_rot = rotate_image(tag_crop, rotate_field)
+                # Поворачиваем кроп для field-модели
+                if tag_rotation != 0:
+                    tag_crop_rotated = rotate_image(tag_crop, tag_rotation)
                 else:
-                    tag_crop_rot = tag_crop
+                    tag_crop_rotated = tag_crop
 
-                field_dets = detect(field_model, tag_crop_rot, conf=conf, imgsz=640)
+                # Сохраняем повёрнутый кроп
+                if debug_dir and debug_frame_count == 0 and track_id <= 3:
+                    cv2.imwrite(str(debug_dir / f"track_{track_id}_tag_crop_rotated.jpg"), tag_crop_rotated)
+
+                # Детекция полей
+                field_dets = detect(field_model, tag_crop_rotated, conf=conf, imgsz=640)
+
+                if field_dets:
+                    # Сохраняем кроп с размеченными полями
+                    if debug_dir and debug_frame_count == 0 and track_id <= 3:
+                        debug_crop = tag_crop_rotated.copy()
+                        for fd in field_dets:
+                            fx1, fy1, fx2, fy2 = fd.bbox
+                            cv2.rectangle(debug_crop, (fx1, fy1), (fx2, fy2), (0, 255, 0), 2)
+                            cv2.putText(debug_crop, fd.class_name, (fx1, fy1 - 5),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                        cv2.imwrite(str(debug_dir / f"track_{track_id}_fields.jpg"), debug_crop)
 
                 for fd in field_dets:
                     field_name = fd.class_name
                     if field_name not in FIELD_CLASSES:
                         continue
 
-                    # Преобразуем координаты поля из повёрнутого кропа в исходный кроп
-                    if rotate_field != 0:
-                        fx1, fy1, fx2, fy2 = fd.bbox
-                        orig_w = tag_crop.shape[1]
-                        orig_h = tag_crop.shape[0]
-                        fx1, fy1, fx2, fy2 = invert_rotate_bbox((fx1, fy1, fx2, fy2), rotate_field, orig_w, orig_h)
-                        fd.bbox = (fx1, fy1, fx2, fy2)  # теперь координаты в tag_crop
-
-                for fd in field_dets:
-                    field_name = fd.class_name
-                    if field_name not in FIELD_CLASSES:
-                        continue
-
-                    # FIX: Определяем, нужно ли обрабатывать это поле на текущем кадре
                     last_proc = track.last_processed_frame.get(field_name, -999)
+
                     if field_name in QR_FIELDS:
                         interval = qr_process_interval
                     elif field_name in PRICE_FIELDS:
-                        interval = max(1, field_process_interval // 2)  # цены чуть чаще
+                        interval = field_process_interval
                     else:
                         interval = field_process_interval
 
                     if frame_idx - last_proc < interval:
-                        continue  # пропускаем, ещё не время
+                        continue
 
-                    # Обновляем время обработки
                     track.last_processed_frame[field_name] = frame_idx
 
                     fx1, fy1, fx2, fy2 = fd.bbox
-                    crop = tag_crop[fy1:fy2, fx1:fx2]
-                    if crop.size == 0:
+                    field_crop = tag_crop_rotated[fy1:fy2, fx1:fx2]
+
+                    if field_crop.size == 0:
                         continue
 
-                    # QR
+                    # Сохраняем кроп поля для отладки
+                    if debug_dir and debug_frame_count == 0 and track_id <= 3:
+                        cv2.imwrite(str(debug_dir / f"track_{track_id}_{field_name}_crop.jpg"), field_crop)
+
+                    # ВАЖНО: Для OCR/QR поворачиваем поле обратно в нормальную ориентацию
+                    if tag_rotation == 90:
+                        field_crop_normal = rotate_image(field_crop, 270)
+                    elif tag_rotation == 270:
+                        field_crop_normal = rotate_image(field_crop, 90)
+                    elif tag_rotation == 180:
+                        field_crop_normal = rotate_image(field_crop, 180)
+                    else:
+                        field_crop_normal = field_crop
+
+                    # QR и штрихкоды (теперь в нормальной ориентации)
                     if field_name == "qr_code_barcode":
-                        qr_text = decode_qr(crop)
+                        qr_text = decode_qr(field_crop_normal)
                         if qr_text:
-                            logger.info(f"Track {track_id}: QR обновлён: {qr_text[:50]}")
                             update_votes(track, "qr_code_barcode", qr_text, 3.0)
                             qr_prices = parse_qr_prices(qr_text)
                             for i, p in enumerate(qr_prices):
                                 if p:
-                                    update_votes(track, f"price{i+1}_qr", p, 2.0)
+                                    update_votes(track, f"price{i + 1}_qr", p, 2.0)
+                        else:
+                            logger.debug(f"Track {track_id}: QR не распознан на поле {field_name}")
                         continue
 
-                    # Штрихкод
                     if field_name == "barcode":
-                        barcode = decode_qr(crop)
+                        barcode = decode_qr(field_crop_normal)
                         if not barcode:
-                            txt, score_ocr = paddle_ocr_enhanced(crop)
+                            txt, score_ocr = paddle_ocr_enhanced(field_crop_normal)
                             barcode = clean_barcode(txt)
                         if barcode:
-                            logger.info(f"Track {track_id}: штрихкод {barcode}")
                             update_votes(track, "barcode", barcode, 2.5)
                         continue
 
-                    # Текстовые поля (OCR)
-                    txt, ocr_conf = paddle_ocr_enhanced(crop)
-                    if txt and ocr_conf > 0.2:
+                    # Текстовые поля (OCR в нормальной ориентации)
+                    txt, ocr_conf = paddle_ocr_enhanced(field_crop_normal)
+
+                    # Логируем даже пустые результаты для отладки
+                    if not txt:
+                        logger.debug(f"Track {track_id}: {field_name} - OCR не дал результатов")
+                    elif ocr_conf <= 0.05:  # Очень низкий порог
+                        logger.debug(f"Track {track_id}: {field_name} - низкая уверенность: '{txt}' ({ocr_conf:.3f})")
+                    else:
                         if field_name in PRICE_FIELDS:
                             txt = clean_price(txt)
-                            if txt:
-                                logger.info(f"Track {track_id}: {field_name} = {txt} (conf {ocr_conf:.2f})")
                         else:
                             txt = clean_text(txt)
-                            if txt:
-                                logger.info(f"Track {track_id}: {field_name} = '{txt}'")
+
                         if txt:
-                            boost = 2.0 if field_name in PRICE_FIELDS else 1.0
-                            update_votes(track, field_name, txt, ocr_conf * boost)
+                            update_votes(track, field_name, txt,
+                                         ocr_conf * (2.0 if field_name in PRICE_FIELDS else 1.0))
 
         frame_idx += 1
+        if debug_frame_count == 0:
+            debug_frame_count += 1  # Сохраняем отладку только для первых кадров
 
-        # Логирование прогресса
-        if frame_idx % 200 == 0:
+        if frame_idx % 100 == 0:
             elapsed = (datetime.now() - start_time).total_seconds()
             progress = (frame_idx / total) * 100 if total > 0 else 0
-            logger.info(f"Прогресс: {progress:.1f}% ({frame_idx}/{total}) | Треков: {len(tracks)} | Время: {elapsed:.1f}с")
+            logger.info(
+                f"Прогресс: {progress:.1f}% ({frame_idx}/{total}) | Треков: {len(tracks)} | Время: {elapsed:.1f}с")
 
     cap.release()
 
@@ -662,6 +730,7 @@ def process_video(
         tr = tracks[tid]
         row = {col: "нет" for col in EXPECTED_COLUMNS}
         row["filename"] = video_path.name if hasattr(video_path, 'name') else str(video_path)
+
         x1, y1, x2, y2 = tr.first_bbox
         row["x_min"] = x1
         row["y_min"] = y1
@@ -673,10 +742,11 @@ def process_video(
             if votes:
                 best = get_best_vote(votes)
                 row[field_name] = best
-                logger.debug(f"Track {tid}: {field_name} = '{best}'")
+                logger.info(f"Track {tid}: {field_name} = '{best}' (всего голосов: {len(votes)})")
 
         if row["price_discount"] == "нет" and row["price_card"] != "нет":
             row["price_discount"] = row["price_card"]
+
         rows.append(row)
 
     out_csv = pathlib.Path(out_csv)
@@ -684,10 +754,14 @@ def process_video(
     df = pd.DataFrame(rows, columns=EXPECTED_COLUMNS)
     df.to_csv(out_csv, index=False, encoding="utf-8-sig")
 
-    non_empty_stats = {col: (df[col] != "нет").sum() for col in EXPECTED_COLUMNS if (df[col] != "нет").sum() > 0}
-    logger.info("=== СТАТИСТИКА РАСПОЗНАВАНИЯ ===")
-    for col, count in sorted(non_empty_stats.items(), key=lambda x: x[1], reverse=True):
-        logger.info(f"  {col}: {count} ценников ({count/len(rows)*100:.1f}%)")
+    if len(rows) > 0:
+        non_empty_stats = {col: (df[col] != "нет").sum() for col in EXPECTED_COLUMNS if (df[col] != "нет").sum() > 0}
+        logger.info("=== СТАТИСТИКА РАСПОЗНАВАНИЯ ===")
+        for col, count in sorted(non_empty_stats.items(), key=lambda x: x[1], reverse=True):
+            logger.info(f"  {col}: {count} ценников ({count / len(rows) * 100:.1f}%)")
+    else:
+        logger.warning("Нет распознанных ценников!")
+
     logger.info(f"Результаты сохранены: {out_csv}")
     return df
 
@@ -703,13 +777,15 @@ def parse_args():
     parser.add_argument("--tag-model", type=pathlib.Path, default=root / "weight" / "best-price-tag.pt")
     parser.add_argument("--field-model", type=pathlib.Path, default=root / "weight" / "best.pt")
     parser.add_argument("--out-csv", type=pathlib.Path, default=root / "runs" / "result.csv")
-    parser.add_argument("--conf", type=float, default=0.25, help="Порог детекции полей")
+    parser.add_argument("--conf", type=float, default=0.15, help="Порог детекции полей")
     parser.add_argument("--imgsz", type=int, default=640, help="Размер для YOLO")
-    parser.add_argument("--frame-stride", type=int, default=2, help="Пропускать кадры")
-    parser.add_argument("--field-interval", type=int, default=5, help="Обрабатывать поля раз в N кадров")
+    parser.add_argument("--frame-stride", type=int, default=1, help="Пропускать кадры")
+    parser.add_argument("--field-interval", type=int, default=2, help="Обрабатывать поля раз в N кадров")
     parser.add_argument("--qr-interval", type=int, default=1, help="QR обрабатывать каждый N кадров")
-    parser.add_argument("--rotate-field", type=int, default=270, choices=[0, 90, 180, 270],
-                        help="Поворот вырезанного ценника перед field моделью (0,90,180,270)")
+    parser.add_argument("--tag-rotation", type=int, default=270, choices=[0, 90, 180, 270],
+                        help="Поворот кропа ценника перед field-моделью")
+    parser.add_argument("--debug-dir", type=pathlib.Path, default=None,
+                        help="Директория для сохранения отладочных изображений")
     return parser.parse_args()
 
 
@@ -725,6 +801,8 @@ def main():
         frame_stride=args.frame_stride,
         field_process_interval=args.field_interval,
         qr_process_interval=args.qr_interval,
+        tag_rotation=args.tag_rotation,
+        debug_dir=args.debug_dir,
     )
 
 
