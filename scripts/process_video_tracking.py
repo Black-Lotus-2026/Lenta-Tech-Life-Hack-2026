@@ -16,6 +16,11 @@ import pandas as pd
 from ultralytics import YOLO
 import easyocr
 
+try:
+    from pyzbar.pyzbar import decode as pyzbar_decode
+except Exception:
+    pyzbar_decode = None
+
 
 def rotate_image(img, deg):
     """Поворот изображения"""
@@ -56,16 +61,38 @@ logger = logging.getLogger("tracking")
 # CONSTANTS
 # ============================================================
 
-PRICE_FIELDS = {"price_card", "price_default", "price_discount"}
-
 EXPECTED_COLUMNS = [
     "filename",
+    "product_name",
     "price_default",
     "price_card",
     "price_discount",
+    "barcode",
+    "discount_amount",
+    "id_sku",
+    "print_datetime",
+    "code",
+    "additional_info",
+    "color",
+    "special_symbols",
     "frame_timestamp",
     "x_min", "y_min", "x_max", "y_max",
+    "qr_code_barcode",
+    "price1_qr", "price2_qr", "price3_qr", "price4_qr",
+    "wholesale_level_1_count", "wholesale_level_1_price",
+    "wholesale_level_2_count", "wholesale_level_2_price",
+    "action_price_qr", "action_code_qr",
 ]
+
+FIELD_CLASSES = {
+    "additional_info", "barcode", "code", "discount_amount", "id_sku",
+    "price_card", "price_default", "price_discount", "print_datetime",
+    "product_name", "qr_code_barcode",
+}
+
+PRICE_FIELDS = {"price_card", "price_default", "price_discount"}
+QR_FIELDS = {"qr_code_barcode", "barcode", "code"}
+TEXT_FIELDS = {"product_name", "additional_info", "print_datetime", "id_sku"}
 
 
 # ============================================================
@@ -83,7 +110,7 @@ class Detection:
 class TrackState:
     track_id: int
     first_frame: int
-    first_bbox: Tuple[int, int, int, int]  # Координаты в оригинальном (повёрнутом) видео
+    first_bbox: Tuple[int, int, int, int]
     last_frame: int
     last_bbox: Tuple[int, int, int, int]
     best_score: float = -1.0
@@ -99,11 +126,13 @@ class TrackState:
 
 logger.info("Инициализация EasyOCR...")
 try:
-    ocr = easyocr.Reader(['en'], gpu=True)
+    ocr_en = easyocr.Reader(['en'], gpu=True)  # Для цифр и латиницы
+    ocr_ru = easyocr.Reader(['ru'], gpu=True)  # Для русского текста
     logger.info("EasyOCR успешно инициализирован")
 except Exception as e:
     logger.error(f"Ошибка EasyOCR: {e}")
-    ocr = None
+    ocr_en = None
+    ocr_ru = None
 
 
 # ============================================================
@@ -159,23 +188,73 @@ def iou(box1, box2):
     return inter / union
 
 
-def extract_price_from_text(text):
-    """
-    Извлекает цену из текста.
-    """
+def preprocess_for_ocr(img, target_h=100):
+    """Предобработка изображения для OCR"""
+    if img is None or img.size == 0:
+        return None
+
+    h, w = img.shape[:2]
+
+    if len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img.copy()
+
+    if h < target_h:
+        scale = target_h / h
+        gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+
+    return gray
+
+
+def preprocess_for_qr(img, target_size=300):
+    """Предобработка для QR/штрихкодов с усилением контраста"""
+    if img is None or img.size == 0:
+        return None
+
+    h, w = img.shape[:2]
+
+    if len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img.copy()
+
+    # Увеличиваем
+    if min(h, w) < target_size:
+        scale = target_size / min(h, w)
+        gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+
+    # Усиливаем контраст
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+
+    return enhanced
+
+
+def clean_text(txt):
+    """Очистка текста"""
+    if not txt:
+        return ""
+    txt = str(txt).replace("\n", " ").replace("\t", " ")
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt
+
+
+def clean_price_text(text):
+    """Извлечение цены из текста"""
     if not text:
         return ""
 
-    # Убираем всё кроме цифр, точки и запятой
     cleaned = re.sub(r'[^\d.,]', '', text)
     cleaned = cleaned.replace(',', '.')
 
-    # Убираем лишние точки, оставляем только последнюю
     parts = cleaned.split('.')
     if len(parts) > 2:
         cleaned = ''.join(parts[:-1]) + '.' + parts[-1]
 
-    # Если нет точки
     if '.' not in cleaned:
         if len(cleaned) >= 3:
             return f"{cleaned[:-2]}.{cleaned[-2:]}"
@@ -183,9 +262,7 @@ def extract_price_from_text(text):
             return f"{cleaned}.00"
         return ""
 
-    # Есть точка
     int_part, frac_part = cleaned.split('.')
-
     if not frac_part:
         return f"{int_part}.00"
     elif len(frac_part) == 1:
@@ -194,77 +271,122 @@ def extract_price_from_text(text):
         return f"{int_part}.{frac_part[:2]}"
 
 
+def clean_discount(text):
+    """Очистка скидки в формате -число%"""
+    if not text:
+        return ""
+
+    # Ищем число со знаком минус или просто число
+    text = str(text).replace(",", ".").replace(" ", "")
+
+    # Паттерн: -число% или число%
+    match = re.search(r'-?\d+\.?\d*\s*%', text)
+    if match:
+        val = match.group()
+        # Убираем пробел перед %
+        val = val.replace(" ", "")
+        # Если нет минуса, добавляем
+        if not val.startswith('-'):
+            val = '-' + val
+        return val
+
+    # Если нет знака %, ищем просто число
+    match = re.search(r'-?\d+\.?\d*', text)
+    if match:
+        val = match.group()
+        if not val.startswith('-'):
+            val = '-' + val
+        return f"{val}%"
+
+    return ""
+
+
+def clean_sku(text):
+    """Очистка артикула (цифры, может быть длинным)"""
+    if not text:
+        return ""
+    digits = re.sub(r'[^\d]', '', str(text))
+    return digits if len(digits) >= 4 else ""
+
+
+def clean_datetime(text):
+    """Очистка даты/времени"""
+    if not text:
+        return ""
+    text = str(text).strip()
+    # Ищем паттерны даты: DD.MM.YYYY или DD/MM/YYYY и т.д.
+    date_match = re.search(r'\d{1,2}[./-]\d{1,2}[./-]\d{2,4}', text)
+    if date_match:
+        return date_match.group()
+
+    time_match = re.search(r'\d{1,2}:\d{2}(:\d{2})?', text)
+    if time_match:
+        return time_match.group()
+
+    return clean_text(text)
+
+
+def parse_qr_prices(qr_text):
+    """Извлечение цен из QR-кода"""
+    if not qr_text:
+        return []
+    vals = re.findall(r'\d+[.,]\d{2}', qr_text)
+    return [v.replace(",", ".") for v in vals[:4]]
+
+
+# ============================================================
+# OCR
+# ============================================================
+
 def ocr_price(img):
-    """Распознавание цены. Изображение уже в нормальной ориентации."""
-    if img is None or img.size == 0 or ocr is None:
+    """Распознавание цены"""
+    if img is None or img.size == 0 or ocr_en is None:
         return "", 0.0
 
-    h, w = img.shape[:2]
+    processed = preprocess_for_ocr(img)
+    if processed is None:
+        return "", 0.0
 
-    # Конвертируем в серый
-    if len(img.shape) == 3:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = img.copy()
+    h, w = processed.shape[:2]
+    logger.info(f"  [price] размер {w}x{h}")
 
-    # Увеличиваем для лучшего распознавания
-    if h < 100:
-        scale = 100 / h
-        gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
-
-    logger.info(f"  OCR: размер {gray.shape[1]}x{gray.shape[0]}")
-
-    # Варианты для распознавания
     variants = [
-        ("normal", gray),
-        ("inverted", cv2.bitwise_not(gray)),
+        ("normal", processed),
+        ("inverted", cv2.bitwise_not(processed)),
     ]
-
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    variants.append(("clahe", clahe.apply(gray)))
-    variants.append(("clahe_inv", cv2.bitwise_not(clahe.apply(gray))))
 
     for vname, variant in variants:
         try:
-            results = ocr.readtext(variant, detail=1, paragraph=False)
+            results = ocr_en.readtext(variant, detail=1, paragraph=False)
 
             if results:
-                # Группируем по размеру: большие цифры = целая часть, маленькие = копейки
                 large_parts = []
                 small_parts = []
 
                 for bbox, text, score in results:
                     y_coords = [p[1] for p in bbox]
                     height = max(y_coords) - min(y_coords)
-
-                    # Только цифры и точка
                     digit_text = re.sub(r'[^\d.]', '', text)
 
                     if digit_text:
                         logger.info(f"  [{vname}] '{digit_text}' h={height:.0f} conf={score:.3f}")
 
-                        if height > gray.shape[0] * 0.5:
+                        if height > h * 0.5:
                             large_parts.append((height, digit_text))
                         else:
                             small_parts.append((height, digit_text))
 
                 if large_parts or small_parts:
-                    # Собираем целую часть
                     large_parts.sort(key=lambda x: x[0], reverse=True)
-                    int_part = ''.join([p[1] for p in large_parts])
-
-                    # Собираем копейки
                     small_parts.sort(key=lambda x: x[0], reverse=True)
+
+                    int_part = ''.join([p[1] for p in large_parts])
                     frac_part = ''.join([p[1] for p in small_parts])
 
-                    # Формируем цену
                     if int_part and frac_part:
                         price = f"{int_part}.{frac_part[:2]}"
                     elif int_part:
-                        if len(int_part) >= 3:
-                            price = f"{int_part[:-2]}.{int_part[-2:]}"
-                        else:
-                            price = f"{int_part}.00"
+                        price = f"{int_part[:-2]}.{int_part[-2:]}" if len(int_part) >= 3 else f"{int_part}.00"
                     elif frac_part:
                         price = f"0.{frac_part[:2]}"
                     else:
@@ -279,6 +401,184 @@ def ocr_price(img):
 
     logger.info(f"  ✗ Цена не распознана")
     return "", 0.0
+
+
+def ocr_discount(img):
+    """Распознавание скидки. Ищет число и форматирует как -число%"""
+    if img is None or img.size == 0 or ocr_en is None:
+        return "", 0.0
+
+    processed = preprocess_for_ocr(img, target_h=80)
+    if processed is None:
+        return "", 0.0
+
+    h, w = processed.shape[:2]
+    logger.info(f"  [discount] размер {w}x{h}")
+
+    variants = [
+        ("normal", processed),
+        ("inverted", cv2.bitwise_not(processed)),
+    ]
+
+    for vname, variant in variants:
+        try:
+            # Для скидки не используем allowlist, чтобы видеть минус и процент
+            results = ocr_en.readtext(variant, detail=1, paragraph=False)
+
+            if results:
+                all_texts = []
+                all_scores = []
+
+                for bbox, text, score in results:
+                    if text.strip():
+                        all_texts.append(text.strip())
+                        all_scores.append(score)
+                        logger.info(f"  [{vname}] '{text.strip()}' conf={score:.3f}")
+
+                if all_texts:
+                    combined = " ".join(all_texts)
+                    avg_score = sum(all_scores) / len(all_scores)
+
+                    # Ищем число (возможно с минусом и процентом)
+                    cleaned = clean_discount(combined)
+                    if cleaned:
+                        logger.info(f"  ✓ Скидка [{vname}]: {cleaned}")
+                        return cleaned, float(avg_score)
+
+        except Exception as e:
+            logger.error(f"  OCR error [{vname}]: {e}")
+
+    logger.info(f"  ✗ Скидка не распознана")
+    return "", 0.0
+
+
+def ocr_text_field(img, field_name):
+    """Распознавание текстового поля с группировкой по размеру шрифта"""
+    if img is None or img.size == 0:
+        return "", 0.0
+
+    # Для русского текста используем ocr_ru, для цифровых полей - ocr_en
+    if field_name in {"id_sku", "print_datetime"}:
+        reader = ocr_en
+    else:
+        reader = ocr_ru
+
+    if reader is None:
+        return "", 0.0
+
+    processed = preprocess_for_ocr(img, target_h=80)
+    if processed is None:
+        return "", 0.0
+
+    h, w = processed.shape[:2]
+    logger.info(f"  [{field_name}] размер {w}x{h}")
+
+    variants = [
+        ("normal", processed),
+        ("inverted", cv2.bitwise_not(processed)),
+    ]
+
+    for vname, variant in variants:
+        try:
+            # НЕ используем paragraph=True - он плохо работает с ценниками
+            results = reader.readtext(variant, detail=1, paragraph=False)
+
+            if results:
+                # Группируем текст по Y-координате (строки)
+                lines = defaultdict(list)
+
+                for bbox, text, score in results:
+                    if not text.strip():
+                        continue
+
+                    # Вычисляем центр Y для группировки по строкам
+                    y_coords = [p[1] for p in bbox]
+                    y_center = sum(y_coords) / len(y_coords)
+                    height = max(y_coords) - min(y_coords)
+
+                    # Группируем по Y с допуском в 30% высоты
+                    line_key = round(y_center / (height * 0.7))
+                    lines[line_key].append((bbox, text.strip(), score, y_center))
+
+                    logger.info(f"  [{vname}] '{text.strip()}' y={y_center:.0f} h={height:.0f} conf={score:.3f}")
+
+                if lines:
+                    # Сортируем строки по Y (сверху вниз)
+                    sorted_lines = sorted(lines.items(), key=lambda x: min(p[3] for p in x[1]))
+
+                    all_texts = []
+                    all_scores = []
+
+                    for line_key, line_parts in sorted_lines:
+                        # Сортируем части в строке по X (слева направо)
+                        line_parts.sort(key=lambda p: min(pt[0] for pt in p[0]))
+                        line_text = " ".join([p[1] for p in line_parts])
+                        line_score = sum(p[2] for p in line_parts) / len(line_parts)
+
+                        all_texts.append(line_text)
+                        all_scores.append(line_score)
+
+                    combined = " ".join(all_texts)
+                    avg_score = sum(all_scores) / len(all_scores)
+
+                    # Очистка в зависимости от типа поля
+                    if field_name == "id_sku":
+                        cleaned = clean_sku(combined)
+                    elif field_name == "print_datetime":
+                        cleaned = clean_datetime(combined)
+                    else:
+                        cleaned = clean_text(combined)
+
+                    if cleaned and len(cleaned) > 1:
+                        logger.info(f"  ✓ [{field_name}] [{vname}]: '{cleaned}'")
+                        return cleaned, float(avg_score)
+
+        except Exception as e:
+            logger.error(f"  OCR error [{vname}]: {e}")
+
+    logger.info(f"  ✗ [{field_name}] не распознано")
+    return "", 0.0
+
+
+def decode_qr_field(img):
+    """Декодирование QR/штрихкода"""
+    if img is None or img.size == 0 or pyzbar_decode is None:
+        return ""
+
+    processed = preprocess_for_qr(img)
+    if processed is None:
+        return ""
+
+    h, w = processed.shape[:2]
+    logger.info(f"  [QR] размер {w}x{h}")
+
+    variants = [
+        ("enhanced", processed),
+        ("inverted", cv2.bitwise_not(processed)),
+    ]
+
+    # Добавляем увеличенный вариант
+    big = cv2.resize(processed, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    variants.append(("big", big))
+
+    results = []
+    for vname, variant in variants:
+        try:
+            decoded = pyzbar_decode(variant)
+            if decoded:
+                for d in decoded:
+                    val = d.data.decode("utf-8", errors="ignore")
+                    if val and val not in results:
+                        results.append(val)
+                        logger.info(f"  ✓ QR [{vname}]: {val[:100]}")
+        except Exception as e:
+            logger.debug(f"  QR error [{vname}]: {e}")
+
+    if results:
+        return " | ".join(results)
+
+    logger.info(f"  ✗ QR не декодирован")
+    return ""
 
 
 # ============================================================
@@ -388,24 +688,22 @@ def process_video(
         conf=0.1,
         imgsz=640,
         frame_stride=1,
-        max_lost_frames=20,
-        tag_rotation=270,  # Поворот ценника в нормальную ориентацию (270 = против часовой)
+        max_lost_frames=30,
+        tag_rotation=270,
         debug_dir=None,
 ):
     """
     Логика:
     1. Видео повёрнуто на 90° по часовой
     2. Tag-модель ищет ценники на повёрнутом видео
-    3. Вырезаем ценник из повёрнутого видео
-    4. Поворачиваем ценник на 270° → нормальная ориентация
-    5. Field-модель ищет поля на нормально ориентированном ценнике
-    6. Вырезаем поля из нормального ценника
-    7. Передаём поля в OCR (они уже в нормальной ориентации)
+    3. Вырезаем ценник, поворачиваем в нормальную ориентацию
+    4. Field-модель ищет поля на нормальном ценнике
+    5. OCR/QR для каждого поля
     """
     start_time = datetime.now()
     logger.info(f"=== НАЧАЛО ОБРАБОТКИ ВИДЕО ===")
     logger.info(f"Видео: {video_path}")
-    logger.info(f"Поворот ценника в нормальную ориентацию: {tag_rotation}°")
+    logger.info(f"Поворот ценника: {tag_rotation}°")
 
     if debug_dir:
         debug_dir = pathlib.Path(debug_dir)
@@ -442,7 +740,7 @@ def process_video(
         processed_frames += 1
         save_debug = debug_dir and debug_saved < 3
 
-        # Шаг 2: Ищем ценники на повёрнутом видео (НЕ поворачиваем видео!)
+        # Ищем ценники на повёрнутом видео
         tag_dets = detect(tag_model, frame, conf=0.1, imgsz=imgsz)
 
         if tag_dets:
@@ -456,14 +754,14 @@ def process_video(
             for track_id, det in matched:
                 track = tracks[track_id]
 
-                # Шаг 3: Вырезаем ценник из повёрнутого видео
+                # Вырезаем ценник
                 x1, y1, x2, y2 = expand_box(det.bbox, pad=0.2, w=frame.shape[1], h=frame.shape[0])
-                tag_crop_rotated = frame[y1:y2, x1:x2]  # Это повёрнутый ценник
+                tag_crop_rotated = frame[y1:y2, x1:x2]
 
                 if tag_crop_rotated.size == 0:
                     continue
 
-                # Шаг 4: Поворачиваем ценник в нормальную ориентацию
+                # Поворачиваем в нормальную ориентацию
                 if tag_rotation != 0:
                     tag_crop_normal = rotate_image(tag_crop_rotated, tag_rotation)
                 else:
@@ -473,7 +771,7 @@ def process_video(
                     cv2.imwrite(str(debug_dir / f"frame{frame_idx}_track{track_id}_rotated.jpg"), tag_crop_rotated)
                     cv2.imwrite(str(debug_dir / f"frame{frame_idx}_track{track_id}_normal.jpg"), tag_crop_normal)
 
-                # Шаг 5: Ищем поля на нормально ориентированном ценнике
+                # Ищем поля на нормальном ценнике
                 field_dets = detect(field_model, tag_crop_normal, conf=conf, imgsz=640)
 
                 if save_debug and debug_saved == 0 and field_dets:
@@ -488,12 +786,12 @@ def process_video(
                 for fd in field_dets:
                     field_name = fd.class_name
 
-                    if field_name not in PRICE_FIELDS:
+                    if field_name not in FIELD_CLASSES:
                         continue
 
-                    # Шаг 6: Вырезаем поле из нормального ценника
+                    # Вырезаем поле
                     fx1, fy1, fx2, fy2 = fd.bbox
-                    field_crop = tag_crop_normal[fy1:fy2, fx1:fx2]  # Уже в нормальной ориентации!
+                    field_crop = tag_crop_normal[fy1:fy2, fx1:fx2]
 
                     if field_crop.size == 0:
                         continue
@@ -501,11 +799,40 @@ def process_video(
                     if save_debug and debug_saved == 0:
                         cv2.imwrite(str(debug_dir / f"frame{frame_idx}_track{track_id}_{field_name}.jpg"), field_crop)
 
-                    # Шаг 7: Передаём в OCR (поле уже в нормальной ориентации)
-                    price, ocr_conf = ocr_price(field_crop)
+                        # Обработка в зависимости от типа поля
+                        if field_name in QR_FIELDS:
+                            # QR/штрихкод
+                            qr_text = decode_qr_field(field_crop)
+                            if qr_text:
+                                if field_name == "qr_code_barcode":
+                                    update_votes(track, "qr_code_barcode", qr_text, 3.0)
+                                    # Парсим цены из QR
+                                    qr_prices = parse_qr_prices(qr_text)
+                                    for i, p in enumerate(qr_prices):
+                                        if p:
+                                            update_votes(track, f"price{i + 1}_qr", p, 2.0)
+                                elif field_name == "barcode":
+                                    update_votes(track, "barcode", qr_text, 2.5)
+                                elif field_name == "code":
+                                    update_votes(track, "code", qr_text, 2.0)
 
-                    if price:
-                        update_votes(track, field_name, price, ocr_conf)
+                        elif field_name in PRICE_FIELDS:
+                            # Цена
+                            price, ocr_conf = ocr_price(field_crop)
+                            if price:
+                                update_votes(track, field_name, price, ocr_conf)
+
+                        elif field_name == "discount_amount":
+                            # Скидка - специальная обработка
+                            discount, ocr_conf = ocr_discount(field_crop)
+                            if discount:
+                                update_votes(track, field_name, discount, ocr_conf)
+
+                        else:
+                            # Текстовые поля
+                            txt, ocr_conf = ocr_text_field(field_crop, field_name)
+                            if txt:
+                                update_votes(track, field_name, txt, ocr_conf)
 
             if save_debug:
                 debug_saved += 1
@@ -541,6 +868,7 @@ def process_video(
                 row[field_name] = get_best_vote(votes)
                 logger.info(f"Track {tid}: {field_name} = {row[field_name]}")
 
+        # Если нет скидочной цены, используем карточную
         if row["price_discount"] == "нет" and row["price_card"] != "нет":
             row["price_discount"] = row["price_card"]
 
@@ -551,12 +879,13 @@ def process_video(
     df = pd.DataFrame(rows, columns=EXPECTED_COLUMNS)
     df.to_csv(out_csv, index=False, encoding="utf-8-sig")
 
-    for col in ["price_default", "price_card", "price_discount"]:
-        count = (df[col] != "нет").sum()
-        if count > 0:
-            logger.info(f"  {col}: {count}/{len(rows)}")
+    # Статистика
+    non_empty = {col: (df[col] != "нет").sum() for col in EXPECTED_COLUMNS if (df[col] != "нет").sum() > 0}
+    logger.info("\n=== СТАТИСТИКА ===")
+    for col, count in sorted(non_empty.items(), key=lambda x: x[1], reverse=True):
+        logger.info(f"  {col}: {count}/{len(rows)}")
 
-    logger.info(f"Результат: {out_csv}")
+    logger.info(f"\nРезультат: {out_csv}")
     return df
 
 
@@ -566,7 +895,7 @@ def process_video(
 
 def parse_args():
     root = resolve_project_root()
-    parser = argparse.ArgumentParser(description="Распознавание цен на ценниках")
+    parser = argparse.ArgumentParser(description="Распознавание ценников на видео")
     parser.add_argument("--video", type=pathlib.Path, required=True)
     parser.add_argument("--tag-model", type=pathlib.Path, default=root / "weight" / "best-price-tag.pt")
     parser.add_argument("--field-model", type=pathlib.Path, default=root / "weight" / "best.pt")
@@ -575,7 +904,7 @@ def parse_args():
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument("--tag-rotation", type=int, default=270, choices=[0, 90, 180, 270],
-                        help="Поворот ценника в нормальную ориентацию (270 = против часовой)")
+                        help="Поворот ценника в нормальную ориентацию")
     parser.add_argument("--debug-dir", type=pathlib.Path, default=pathlib.Path("./debug"))
     return parser.parse_args()
 

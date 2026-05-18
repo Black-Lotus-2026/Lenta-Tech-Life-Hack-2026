@@ -12,3 +12,4 @@ models/*.rknn
 models/*_openvino_model/
 *.log
 .DS_Store
+debug
