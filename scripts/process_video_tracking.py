@@ -196,25 +196,59 @@ def preprocess_for_ocr(img, target_h=100):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     else:
         gray = img.copy()
+
+    # Сначала увеличиваем изображение (очень важно для мелкого текста)
     if h < target_h:
         scale = target_h / h
+        # Если увеличение сильное, используем 2x - 4x напрямую, но здесь ограничимся гибким scale
         gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray = clahe.apply(gray)
+    else:
+        # Для надежности всегда увеличиваем в 2 раза
+        gray = cv2.resize(gray, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+
+    # Подавляем шум
+    gray = cv2.fastNlMeansDenoising(gray, None, h=10, searchWindowSize=21, templateWindowSize=7)
+
+    # Резкость (Sharpen) поможет OCR лучше видеть границы букв
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    gray = cv2.filter2D(gray, -1, kernel)
+
     return gray
+
+def get_variants_for_ocr(processed_gray):
+    # Otsu бинаризация
+    _, thresh_otsu = cv2.threshold(processed_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # Adaptive threshold
+    thresh_adaptive = cv2.adaptiveThreshold(
+        processed_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+    
+    return [
+        ("normal", processed_gray),
+        ("inverted", cv2.bitwise_not(processed_gray)),
+        ("otsu", thresh_otsu),
+        ("adaptive", thresh_adaptive)
+    ]
 
 
 def preprocess_for_qr(img, target_size=300):
     if img is None or img.size == 0:
         return None
+    
+    # Добавляем белые поля (padding / quiet zone), без них QR почти не читается
+    pad = 20
+    img = cv2.copyMakeBorder(img, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=[255, 255, 255])
+    
     h, w = img.shape[:2]
     if len(img.shape) == 3:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     else:
         gray = img.copy()
+        
     if min(h, w) < target_size:
         scale = target_size / min(h, w)
         gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+        
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
     return enhanced
@@ -232,13 +266,15 @@ def clean_discount(text):
     if not text:
         return ""
     text = str(text).replace(",", ".").replace(" ", "")
-    match = re.search(r'-?\d+\.?\d*\s*%', text)
+    # Ищем от 1 до 2 цифр (защита от -369% или -799%)
+    match = re.search(r'-?\d{1,2}\s*%', text)
     if match:
         val = match.group().replace(" ", "")
         if not val.startswith('-'):
             val = '-' + val
         return val
-    match = re.search(r'-?\d+\.?\d*', text)
+    # Фоллбек: если процента нет, но есть 1-2 цифры
+    match = re.search(r'-?\d{1,2}(?!\d)', text)
     if match:
         val = match.group()
         if not val.startswith('-'):
@@ -286,10 +322,7 @@ def ocr_price(img):
         return "", 0.0
     h, w = processed.shape[:2]
     logger.info(f"  [price] размер {w}x{h}")
-    variants = [
-        ("normal", processed),
-        ("inverted", cv2.bitwise_not(processed)),
-    ]
+    variants = get_variants_for_ocr(processed)
     for vname, variant in variants:
         try:
             results = ocr_en.readtext(variant, detail=1, paragraph=False)
@@ -335,10 +368,7 @@ def ocr_discount(img):
         return "", 0.0
     h, w = processed.shape[:2]
     logger.info(f"  [discount] размер {w}x{h}")
-    variants = [
-        ("normal", processed),
-        ("inverted", cv2.bitwise_not(processed)),
-    ]
+    variants = get_variants_for_ocr(processed)
     for vname, variant in variants:
         try:
             results = ocr_en.readtext(variant, detail=1, paragraph=False)
@@ -373,10 +403,7 @@ def ocr_text_field(img, field_name):
         return "", 0.0
     h, w = processed.shape[:2]
     logger.info(f"  [{field_name}] размер {w}x{h}")
-    variants = [
-        ("normal", processed),
-        ("inverted", cv2.bitwise_not(processed)),
-    ]
+    variants = get_variants_for_ocr(processed)
     for vname, variant in variants:
         try:
             results = reader.readtext(variant, detail=1, paragraph=False)
@@ -425,23 +452,43 @@ def decode_qr_field(img):
         return ""
     h, w = processed.shape[:2]
     logger.info(f"  [QR] размер {w}x{h}")
+    
+    # Добавляем Otsu-бинаризацию как один из вариантов
+    _, thresh = cv2.threshold(processed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
     variants = [
         ("enhanced", processed),
         ("inverted", cv2.bitwise_not(processed)),
         ("big", cv2.resize(processed, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)),
+        ("threshold", thresh)
     ]
     results = []
+    detector = cv2.QRCodeDetector()
+    
     for vname, variant in variants:
-        try:
-            decoded = pyzbar_decode(variant)
-            if decoded:
-                for d in decoded:
-                    val = d.data.decode("utf-8", errors="ignore")
-                    if val and val not in results:
-                        results.append(val)
-                        logger.info(f"  ✓ QR [{vname}]: {val[:100]}")
-        except Exception as e:
-            logger.debug(f"  QR error [{vname}]: {e}")
+        # Пытаемся прочитать через pyzbar
+        if pyzbar_decode is not None:
+            try:
+                decoded = pyzbar_decode(variant)
+                if decoded:
+                    for d in decoded:
+                        val = d.data.decode("utf-8", errors="ignore")
+                        if val and val not in results:
+                            results.append(val)
+                            logger.info(f"  ✓ QR [{vname}] (pyzbar): {val[:100]}")
+            except Exception as e:
+                logger.debug(f"  QR pyzbar error [{vname}]: {e}")
+                
+        # Пытаемся прочитать через cv2 (фоллбек)
+        if not results:
+            try:
+                val, pts, _ = detector.detectAndDecode(variant)
+                if val and val not in results:
+                    results.append(val)
+                    logger.info(f"  ✓ QR [{vname}] (cv2): {val[:100]}")
+            except Exception as e:
+                logger.debug(f"  QR cv2 error [{vname}]: {e}")
+
     if results:
         return " | ".join(results)
     logger.info(f"  ✗ QR не декодирован")
@@ -577,6 +624,29 @@ def match_tracks(tracks, detections, frame_idx, next_track_id, max_lost=30):
 # MAIN
 # ============================================================
 
+def detect_color(tag_crop_hsv):
+    if tag_crop_hsv is None:
+        return "white"
+    
+    lower_red1 = np.array([0, 50, 50])
+    upper_red1 = np.array([10, 255, 255])
+    lower_red2 = np.array([170, 50, 50])
+    upper_red2 = np.array([180, 255, 255])
+    
+    lower_yellow = np.array([15, 50, 50])
+    upper_yellow = np.array([35, 255, 255])
+
+    mask_red = cv2.inRange(tag_crop_hsv, lower_red1, upper_red1) | cv2.inRange(tag_crop_hsv, lower_red2, upper_red2)
+    mask_yellow = cv2.inRange(tag_crop_hsv, lower_yellow, upper_yellow)
+    
+    pixels = tag_crop_hsv.shape[0] * tag_crop_hsv.shape[1]
+    
+    if cv2.countNonZero(mask_yellow) / pixels > 0.15:
+        return "yellow"
+    if cv2.countNonZero(mask_red) / pixels > 0.15:
+        return "red"
+    return "white"
+
 def process_video(
         video_path,
         tag_model_path,
@@ -587,6 +657,7 @@ def process_video(
         frame_stride=1,
         tag_rotation=270,
         debug_dir=None,
+        progress_callback=None,
 ):
     start_time = datetime.now()
     logger.info(f"=== НАЧАЛО ОБРАБОТКИ ВИДЕО ===")
@@ -621,6 +692,17 @@ def process_video(
         if not ok:
             break
 
+        if progress_callback and frame_idx % 5 == 0:
+            if total > 0:
+                progress = (frame_idx / total) * 100
+            else:
+                ratio = cap.get(cv2.CAP_PROP_POS_AVI_RATIO)
+                progress = ratio * 100 if ratio >= 0 else 0
+            # Убедимся, что прогресс не застревает
+            if progress <= 0 and frame_idx > 0 and total <= 0:
+                progress = min((frame_idx / 300) * 100, 99.0)  # фоллбек на 300 кадров
+            progress_callback(min(max(progress, 0.0), 99.0))
+
         if frame_idx % frame_stride != 0:
             frame_idx += 1
             continue
@@ -651,6 +733,12 @@ def process_video(
                     tag_crop_normal = rotate_image(tag_crop_rotated, tag_rotation)
                 else:
                     tag_crop_normal = tag_crop_rotated
+
+                # Определяем цвет
+                hsv_img = cv2.cvtColor(tag_crop_normal, cv2.COLOR_BGR2HSV)
+                color = detect_color(hsv_img)
+                if color:
+                    update_votes(track, "color", color, 1.0)
 
                 if save_debug and debug_saved == 0:
                     cv2.imwrite(str(debug_dir / f"frame{frame_idx}_track{track_id}_rotated.jpg"), tag_crop_rotated)
@@ -728,6 +816,9 @@ def process_video(
     logger.info(f"\n=== ГОТОВО ===")
     logger.info(f"Кадров: {processed_frames}, треков: {len(tracks)}, время: {elapsed_total:.1f}с")
 
+    if progress_callback:
+        progress_callback(99.5)
+
     rows = []
     for tid in sorted(tracks.keys()):
         tr = tracks[tid]
@@ -745,25 +836,8 @@ def process_video(
                 row[field_name] = get_best_vote(votes)
                 logger.info(f"Track {tid}: {field_name} = {row[field_name]} ({len(votes)} голосов)")
 
-        # Взаимное дублирование цен:
-        # Если price_card нет, берём из price_discount
-        if row["price_card"] == "нет" and row["price_discount"] != "нет":
-            row["price_card"] = row["price_discount"]
-            logger.info(f"Track {tid}: price_card ← price_discount = {row['price_card']}")
-
-        # Если price_discount нет, берём из price_card
-        if row["price_discount"] == "нет" and row["price_card"] != "нет":
-            row["price_discount"] = row["price_card"]
-            logger.info(f"Track {tid}: price_discount ← price_card = {row['price_discount']}")
-
-        # Если price_default нет, берём из price_card или price_discount
-        if row["price_default"] == "нет":
-            if row["price_card"] != "нет":
-                row["price_default"] = row["price_card"]
-                logger.info(f"Track {tid}: price_default ← price_card = {row['price_default']}")
-            elif row["price_discount"] != "нет":
-                row["price_default"] = row["price_discount"]
-                logger.info(f"Track {tid}: price_default ← price_discount = {row['price_default']}")
+        # УБРАНА агрессивная логика дублирования цен друг из друга,
+        # так как она портит данные, когда price_discount по факту нет.
 
         rows.append(row)
 
@@ -778,6 +852,10 @@ def process_video(
         logger.info(f"  {col}: {count}/{len(rows)}")
 
     logger.info(f"\nРезультат: {out_csv}")
+    
+    if progress_callback:
+        progress_callback(100.0)
+        
     return df
 
 
