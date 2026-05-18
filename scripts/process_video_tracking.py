@@ -480,7 +480,7 @@ def detect(model, frame, conf, imgsz):
 
 
 # ============================================================
-# TRACKING (ИСПРАВЛЕННЫЙ)
+# TRACKING
 # ============================================================
 
 def update_votes(track, field_name, value, score):
@@ -500,12 +500,6 @@ def get_best_vote(votes):
 
 
 def match_tracks(tracks, detections, frame_idx, next_track_id, max_lost=30):
-    """
-    Исправленный трекинг:
-    - max_lost=30 (трек живёт дольше)
-    - пониженный порог IoU (0.03)
-    - восстановление недавно потерянных треков
-    """
     IOU_THRESH = 0.03
     RECOVERY_FRAMES = 5
     RECOVERY_IOU = 0.1
@@ -514,7 +508,6 @@ def match_tracks(tracks, detections, frame_idx, next_track_id, max_lost=30):
     used_tracks = set()
     used_detections = set()
 
-    # Проход 1: матчим существующие треки
     for det_idx, det in enumerate(detections):
         best_id = None
         best_score = -1
@@ -536,7 +529,6 @@ def match_tracks(tracks, detections, frame_idx, next_track_id, max_lost=30):
             used_tracks.add(best_id)
             used_detections.add(det_idx)
 
-    # Проход 2: восстанавливаем недавно потерянные треки
     for det_idx, det in enumerate(detections):
         if det_idx in used_detections:
             continue
@@ -558,7 +550,6 @@ def match_tracks(tracks, detections, frame_idx, next_track_id, max_lost=30):
             used_tracks.add(best_lost_id)
             used_detections.add(det_idx)
 
-    # Проход 3: новые треки для оставшихся детекций
     for det_idx, det in enumerate(detections):
         if det_idx in used_detections:
             continue
@@ -571,12 +562,10 @@ def match_tracks(tracks, detections, frame_idx, next_track_id, max_lost=30):
         matched.append((tid, det))
         used_tracks.add(tid)
 
-    # Увеличиваем lost_counter
     for tid, track in tracks.items():
         if tid not in used_tracks:
             track.lost_counter += 1
 
-    # Удаляем старые треки
     to_del = [tid for tid, track in tracks.items() if track.lost_counter > max_lost]
     for tid in to_del:
         del tracks[tid]
@@ -756,8 +745,25 @@ def process_video(
                 row[field_name] = get_best_vote(votes)
                 logger.info(f"Track {tid}: {field_name} = {row[field_name]} ({len(votes)} голосов)")
 
+        # Взаимное дублирование цен:
+        # Если price_card нет, берём из price_discount
+        if row["price_card"] == "нет" and row["price_discount"] != "нет":
+            row["price_card"] = row["price_discount"]
+            logger.info(f"Track {tid}: price_card ← price_discount = {row['price_card']}")
+
+        # Если price_discount нет, берём из price_card
         if row["price_discount"] == "нет" and row["price_card"] != "нет":
             row["price_discount"] = row["price_card"]
+            logger.info(f"Track {tid}: price_discount ← price_card = {row['price_discount']}")
+
+        # Если price_default нет, берём из price_card или price_discount
+        if row["price_default"] == "нет":
+            if row["price_card"] != "нет":
+                row["price_default"] = row["price_card"]
+                logger.info(f"Track {tid}: price_default ← price_card = {row['price_default']}")
+            elif row["price_discount"] != "нет":
+                row["price_default"] = row["price_discount"]
+                logger.info(f"Track {tid}: price_default ← price_discount = {row['price_default']}")
 
         rows.append(row)
 
