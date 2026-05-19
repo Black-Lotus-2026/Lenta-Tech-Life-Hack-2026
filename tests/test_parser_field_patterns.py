@@ -13,6 +13,11 @@ def test_extended_code_patterns_from_external_solutions():
     assert _parse("код 21_ЦПУ")["code"] == "21_ЦПУ"
 
 
+def test_code_parser_rejects_short_ocr_alpha_garbage():
+    for text in ["469AK", "133SE", "99VA", "99LUBC", "214HONG", "код 469AK"]:
+        assert _parse(text)["code"] == "нет"
+
+
 def test_price_ocr_digit_confusions_are_recovered():
     fields = _parse("Цена 1O9 99 руб")
     assert fields["price_default"] == "109.99"
