@@ -13,8 +13,10 @@ app = FastAPI()
 
 templates = Jinja2Templates(directory="templates")
 
-UPLOAD_DIR = Path("uploads")
-OUTPUT_DIR = Path("outputs")
+default_runtime_dir = Path("/tmp/lenta_runtime") if os.environ.get("VERCEL") else Path(".")
+runtime_dir = Path(os.environ.get("LENTA_RUNTIME_DIR", str(default_runtime_dir)))
+UPLOAD_DIR = Path(os.environ.get("LENTA_UPLOAD_DIR", str(runtime_dir / "uploads")))
+OUTPUT_DIR = Path(os.environ.get("LENTA_OUTPUT_DIR", str(runtime_dir / "outputs")))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
