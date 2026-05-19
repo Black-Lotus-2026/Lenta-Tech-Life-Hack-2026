@@ -1,20 +1,13 @@
 import os
 import uuid
-import sys
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Form
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from fastapi.requests import Request
-import threading
 
-# Add scripts directory to path to import process_video
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "scripts")))
-try:
-    from process_video_tracking import process_video
-except ImportError as e:
-    print("Warning: Could not import process_video_tracking from scripts directory", e)
+from lenta_shelf_ai.pipeline import PipelineConfig, PriceTagPipeline
 
 app = FastAPI()
 
@@ -37,39 +30,39 @@ tasks = {}
 def process_video_task(task_id: str, video_path: Path, frame_stride: int = 50):
     tasks[task_id] = {"status": "processing", "progress": 0.0, "csv_path": None, "error": None}
 
-    def progress_callback(pct: float):
-        tasks[task_id]["progress"] = pct
-
-    # Construct paths
     root_dir = Path(os.path.abspath(os.path.dirname(__file__)))
-    tag_model_path = root_dir / "weight" / "best-price-tag.pt"
-    field_model_path = root_dir / "weight" / "best.pt"
     out_csv = OUTPUT_DIR / f"{task_id}.csv"
 
     try:
-        process_video(
-            video_path=video_path,
-            tag_model_path=tag_model_path,
-            field_model_path=field_model_path,
-            out_csv=out_csv,
-            conf=0.1,
-            imgsz=640,
-            frame_stride=frame_stride,
-            tag_rotation=270,
-            debug_dir=None, # Disable debug images as per instructions
-            progress_callback=progress_callback
-        )
+        cfg = PipelineConfig.from_file(root_dir / "configs" / "default.yaml")
+        cfg.yolo_weights = str(root_dir / "models" / "price_tag_yolo.pt")
+        cfg.field_zone_weights = str(root_dir / "models" / "field_zone_yolo.pt")
+        cfg.save_crops = False
+        cfg.save_debug_json = True
+        cfg.field_zone_save_crops = False
+        cfg.max_frames = 0
+        # The UI still exposes frame_stride for fast demos. Convert it into an
+        # approximate FPS cap instead of skipping arbitrary frames in the app.
+        if frame_stride >= 80:
+            cfg.sample_fps = min(float(cfg.sample_fps), 1.0)
+        elif frame_stride >= 40:
+            cfg.sample_fps = min(float(cfg.sample_fps), 2.0)
+        else:
+            cfg.sample_fps = min(float(cfg.sample_fps), 4.0)
 
-        # Mark as done
+        tasks[task_id]["progress"] = 5.0
+        pipe = PriceTagPipeline(cfg)
+        task_output_dir = OUTPUT_DIR / task_id
+        task_output_dir.mkdir(parents=True, exist_ok=True)
+        df = pipe.run_video(video_path, output_dir=task_output_dir, output_csv=out_csv)
+
         tasks[task_id]["status"] = "done"
         tasks[task_id]["progress"] = 100.0
         tasks[task_id]["csv_path"] = str(out_csv)
+        tasks[task_id]["rows"] = int(len(df))
     except Exception as e:
         tasks[task_id]["status"] = "error"
         tasks[task_id]["error"] = str(e)
-    finally:
-        # Cleanup video if you want, or keep it. Let's clean up to save space.
-        pass
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -87,7 +80,7 @@ async def upload_video(background_tasks: BackgroundTasks, file: UploadFile = Fil
         content = await file.read()
         buffer.write(content)
 
-    tasks[task_id] = {"status": "pending", "progress": 0.0, "csv_path": None, "error": None}
+    tasks[task_id] = {"status": "pending", "progress": 0.0, "csv_path": None, "error": None, "rows": 0}
     background_tasks.add_task(process_video_task, task_id, video_path, frame_stride)
 
     return JSONResponse({"task_id": task_id})
