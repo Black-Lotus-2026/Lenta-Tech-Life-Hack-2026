@@ -1,0 +1,82 @@
+# Lenta Shelf AI default config. Works offline; put trained YOLO weights to models/price_tag_yolo.pt.
+sample_fps: 4.0
+yolo_weights: models/price_tag_yolo.pt
+yolo_conf: 0.08
+detector_imgsz: 1600
+enable_fallback_detectors: false
+min_sharpness: 18.0
+max_frames: 0
+max_detections_per_frame: 80
+detection_edge_margin_ratio: 0.0  # optional edge-crop gate; >0 drops partial-frame boxes
+enable_focus_quality: true  # best-crop focus score for semantic selection
+enable_ocr: true
+enable_qr: true
+defer_ocr: false
+prefer_paddle: false  # PaddleOCR can SIGSEGV in Kaggle; enable only in isolated ablation
+ocr_lang: ru
+use_gpu: false
+crop_pad_px: 8
+tracker_iou: 0.12
+tracker_center_threshold: 250.0
+max_lost: 5
+min_track_observations: 1
+dedupe_iou: 0.30
+dedupe_center_threshold: 90.0
+dedupe_time_window_ms: 1600
+representative_temporal_weight: 0.0
+save_crops: false
+save_debug_json: true
+enable_zonal_ocr: true
+qr_expansion_x: 0.55
+qr_expansion_y: 0.45
+dedupe_visual_hash_threshold: 14
+dedupe_text_similarity: 0.86
+dedupe_extended_time_window_ms: 12000
+dedupe_row_y_threshold_ratio: 0.55
+fallback_min_observations: 3
+fallback_require_evidence: true
+
+# Deferred recognition budget: QR is cheap/important, OCR is expensive.
+deferred_qr_top_k: 5
+deferred_ocr_top_k: 1
+deferred_recognition_top_k: 5
+
+# Field-zone detector: run a second YOLO inside each detected price tag crop.
+# models/field_zone_yolo.pt detects semantic regions such as product_name,
+# qr_code_barcode, price_default, price_discount and barcode.
+enable_field_zone_detector: true
+field_zone_weights: models/field_zone_yolo.pt
+field_zone_conf: 0.10
+field_zone_imgsz: 640
+field_zone_use_heuristic_fallback: true
+field_zone_padding_ratio: 0.10
+field_zone_qr_top_k: 4
+field_zone_barcode_top_k: 4
+field_zone_ocr_top_k: 12
+field_zone_ocr_per_label_top_k: 1
+field_zone_full_crop_fallback: true
+field_zone_qr_full_crop_fallback: true
+field_zone_qr_context_fallback: true
+field_zone_ocr_full_crop_fallback: true
+field_zone_save_crops: false
+field_zone_max_failure_crops: 120  # cap debug qr_failure_crops so Kaggle outputs stay downloadable
+# Team clean branch finding: whole-tag detector works on rotated video crops,
+# while field-zone YOLO was trained on upright tag crops. Try all right-angle
+# rotations and choose the best zone score; this prevents a hard-coded 270 deg
+# assumption from hiding id_sku/date/code crops on other videos.
+field_zone_crop_rotations: [270, 0, 90, 180]
+
+# Temporal QR/barcode reconstruction: disabled by default for local speed.
+# On Kaggle/T4 enable it for QR-first experiments after tracking is built.
+temporal_qr_reconstruction: false
+temporal_qr_top_k: 6
+temporal_qr_min_crops: 2
+temporal_qr_max_side: 384
+temporal_qr_max_composites: 8
+
+# Optional ensemble features. They are off by default until validated on public/Kaggle.
+# To use extra detector weights, set yolo_weights to an os.pathsep/comma-separated list
+# or export LENTA_ENABLE_YOLO_ENSEMBLE=1 / LENTA_EXTRA_YOLO_WEIGHTS.
+enable_crop_rectification: false
+crop_rectification_min_area_ratio: 0.16
+crop_rectification_max_area_ratio: 0.98
